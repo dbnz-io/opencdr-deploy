@@ -16,7 +16,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install --upgrade pip build twine
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: pytest
       - name: Verify release tag matches package version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -24,8 +27,16 @@ jobs:
           python - <<'PY'
           import os
           import tomllib
+          from pathlib import Path
 
           version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          namespace = {}
+          exec(Path("src/opencdr_deploy/__init__.py").read_text(), namespace)
+          code_version = namespace["__version__"]
+          if code_version != version:
+              raise SystemExit(
+                  f"runtime version {code_version!r} must equal project version {version!r}"
+              )
           expected = f"v{version}"
           actual = os.environ["RELEASE_TAG"]
           if actual != expected:
