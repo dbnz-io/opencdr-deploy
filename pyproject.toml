@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opencdr-deploy"
+version = "0.1.0"
+description = "Install and manage multiple OpenCDR Core deployments"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "DBNZ"}]
+keywords = ["opencdr", "aws", "security", "deployment", "serverless"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Security",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8,<10",
+  "ruff>=0.12,<1",
+  "twine>=6,<7",
+]
+
+[project.urls]
+Homepage = "https://github.com/dbnz-io/opencdr-deploy"
+Repository = "https://github.com/dbnz-io/opencdr-deploy"
+Issues = "https://github.com/dbnz-io/opencdr-deploy/issues"
+
+[project.scripts]
+opencdr-deploy = "opencdr_deploy.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opencdr_deploy"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
