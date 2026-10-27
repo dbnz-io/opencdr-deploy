@@ -28,22 +28,34 @@ python3 -m venv .venv
 python -m pip install -e '.[dev]'
 ```
 
-## Register installations
+## Install Core and register installations
 
 The registry defaults to `~/.config/opencdr/deployments.json`, is mode `0600`,
 and contains no credentials. Override its location with `--registry` or
 `OPENCDR_DEPLOY_REGISTRY`.
 
+A separate OpenCDR Core clone is not required. The manager can download an
+exact release tag into its managed source directory and retain each installed
+version:
+
 ```bash
 opencdr-deploy installations add customer-production \
-  --repository /opt/opencdr/releases/1.4.0 \
+  --core-version v1.2.1 \
   --stage prod \
   --region eu-west-1 \
   --aws-profile customer-production \
+  --expected-account-id 111111111111 \
   --security-profile hardened \
   --archive true \
   --xray true
 
+opencdr-deploy installations versions customer-production
+# Upgrade or roll back by selecting another published tag.
+opencdr-deploy installations upgrade customer-production \
+  --core-version v1.2.0 \
+  --prepare
+
+# Local checkouts remain supported for development and forks.
 opencdr-deploy installations add customer-staging \
   --repository ~/src/opencdr-staging \
   --stage staging \
@@ -55,9 +67,79 @@ opencdr-deploy installations list
 opencdr-deploy installations show customer-production
 ```
 
+Managed releases default to `https://github.com/dbnz-io/opencdr.git` and
+`~/.local/share/opencdr-deploy/core`. Override those with
+`--core-repository-url` and `--source-root`. Only version-shaped immutable tags
+such as `v1.2.1` are accepted. Old versions are retained, so rollback means
+running `installations upgrade` with the previous tag. Removing a registry
+entry does not delete managed source or AWS resources.
+
 AWS credentials remain in the normal AWS configuration or IAM Identity Center
 credential chain. Serverless credentials remain in Serverless' own mechanism.
 Potentially secret parameter names are rejected from the registry.
+
+## Configure several accounts from TOML
+
+Every installation, AWS profile/account, Core version, and feature flag can be
+declared in one TOML file. Start from
+[`examples/fleet.toml`](examples/fleet.toml):
+
+```toml
+version = 1
+
+[defaults]
+core_version = "v1.2.1"
+region = "us-east-1"
+
+[defaults.features]
+archive = true
+xray = true
+security_profile = "hardened"
+
+[[deployments]]
+name = "customer-a-production"
+stage = "prod"
+aws_profile = "customer-a-production"
+expected_account_id = "111111111111"
+
+[[deployments]]
+name = "customer-b-production"
+stage = "prod"
+aws_profile = "customer-b-production"
+expected_account_id = "222222222222"
+
+[deployments.features]
+archive = false
+```
+
+Reconcile all entries, or select one:
+
+```bash
+# Validate and show intended source operations without writing state.
+opencdr-deploy apply --file fleet.toml --dry-run
+
+# Download Core versions and update the local registry.
+opencdr-deploy apply --file fleet.toml
+
+# Also install locked dependencies, package, and deploy each installation.
+opencdr-deploy apply --file fleet.toml --prepare --deploy
+
+opencdr-deploy apply --file fleet.toml \
+  --select customer-a-production \
+  --prepare --deploy
+```
+
+`[features]` provides typed values for `archive`, `xray`, and
+`security_profile`. Any other non-secret Serverless option belongs under
+`[parameters]`. Do not put credentials or API keys in the file; secret-shaped
+parameter names are rejected.
+
+`expected_account_id` is strongly recommended. Before any live AWS operation,
+the manager resolves the selected profile with STS and stops if the account is
+not the configured 12-digit ID. Multi-account apply is fail-fast by default;
+`--continue-on-error` attempts the remaining entries. It is not a distributed
+transaction: successful deployments are not rolled back if a later account
+fails.
 
 ## Install dependencies and deploy
 
@@ -75,7 +157,8 @@ DEPLOY=(opencdr-deploy --deployment customer-production)
 creates a Python 3.12 virtual environment, and installs its locked, hashed
 Python dependencies.
 
-`deploy` packages first unless `--artifact` is provided. Each package has a
+`deploy` verifies `expected_account_id` and packages first unless `--artifact`
+is provided. Each package has a
 manifest containing its Core Git revision, deployment configuration, creation
 time, and SHA-256 digest. Deployment rejects modified artifacts, artifacts for
 another installation, dirty source trees, and unacknowledged

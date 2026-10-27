@@ -1,0 +1,36 @@
+version = 1
+
+[defaults]
+core_version = "v1.2.1"
+core_repository_url = "https://github.com/dbnz-io/opencdr.git"
+region = "us-east-1"
+
+[defaults.features]
+archive = true
+xray = true
+security_profile = "hardened"
+
+[defaults.parameters]
+alarmEmail = "operations@example.com"
+
+[[deployments]]
+name = "customer-a-production"
+stage = "prod"
+aws_profile = "customer-a-production"
+expected_account_id = "111111111111"
+
+[deployments.parameters]
+alertEmail = "security-a@example.com"
+
+[[deployments]]
+name = "customer-b-production"
+stage = "prod"
+region = "eu-west-1"
+aws_profile = "customer-b-production"
+expected_account_id = "222222222222"
+
+[deployments.features]
+archive = false
+
+[deployments.parameters]
+alertEmail = "security-b@example.com"

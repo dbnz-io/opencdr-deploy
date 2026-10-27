@@ -20,6 +20,14 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from . import __version__
+from .fleet import FleetConfigError, load_fleet_config
+from .sources import (
+    DEFAULT_CORE_REPOSITORY,
+    DEFAULT_SOURCE_ROOT,
+    SourceError,
+    install_core_source,
+    installed_versions,
+)
 
 DEFAULT_REGISTRY = Path(
     os.environ.get("OPENCDR_DEPLOY_REGISTRY", "~/.config/opencdr/deployments.json")
@@ -112,7 +120,7 @@ def parse_assignment(raw: str) -> tuple[str, str]:
     return key, value
 
 
-def validate_deployment(deployment: dict[str, Any]) -> None:
+def validate_deployment(deployment: dict[str, Any], *, require_repository: bool = True) -> None:
     for field in ("repository", "stage", "region"):
         if not isinstance(deployment.get(field), str) or not deployment[field].strip():
             raise DeployError(f"Deployment field {field!r} is required")
@@ -120,9 +128,13 @@ def validate_deployment(deployment: dict[str, Any]) -> None:
         raise DeployError("Stage must contain only letters, numbers, dots, underscores or hyphens")
     if not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d", deployment["region"]):
         raise DeployError(f"Invalid AWS region name: {deployment['region']!r}")
-    repo = _path(deployment["repository"])
-    if not (repo / "serverless.yml").is_file() or not (repo / "scripts").is_dir():
-        raise DeployError(f"Not an OpenCDR repository: {repo}")
+    if require_repository:
+        repo = _path(deployment["repository"])
+        if not (repo / "serverless.yml").is_file() or not (repo / "scripts").is_dir():
+            raise DeployError(f"Not an OpenCDR repository: {repo}")
+    expected_account_id = deployment.get("expected_account_id")
+    if expected_account_id is not None and not re.fullmatch(r"\d{12}", expected_account_id):
+        raise DeployError("expected_account_id must contain exactly 12 digits")
     parameters = deployment.setdefault("parameters", {})
     if not isinstance(parameters, dict):
         raise DeployError("Deployment parameters must be an object")
@@ -365,6 +377,96 @@ def aws_json(deployment: dict[str, Any], arguments: list[str]) -> Any:
     return json.loads(result.stdout)
 
 
+def verify_expected_account(deployment: dict[str, Any]) -> str:
+    expected = deployment.get("expected_account_id")
+    if not expected:
+        return ""
+    identity = aws_json(deployment, ["sts", "get-caller-identity"])
+    actual = str(identity.get("Account", ""))
+    if actual != expected:
+        raise DeployError(
+            f"AWS account mismatch for profile {deployment.get('aws_profile') or '<default>'}: "
+            f"expected {expected}, got {actual or '<unknown>'}"
+        )
+    return actual
+
+
+def prepare_deployment(
+    deployment: dict[str, Any], *, runtime_only: bool, skip_submodules: bool, dry_run: bool
+) -> None:
+    repo = repository(deployment)
+    if not skip_submodules:
+        run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=repo,
+            env=deployment_env(deployment),
+            dry_run=dry_run,
+        )
+    run(["npm", "ci"], cwd=repo, env=deployment_env(deployment), dry_run=dry_run)
+    python = shutil.which("python3.12")
+    if not python:
+        raise DeployError("Python 3.12 was not found")
+    run([python, "-m", "venv", ".venv"], cwd=repo, dry_run=dry_run)
+    requirements = "requirements.txt" if runtime_only else "requirements-dev.txt"
+    run(
+        [
+            str(repo / ".venv" / "bin" / "pip"),
+            "install",
+            "--require-hashes",
+            "-r",
+            requirements,
+        ],
+        cwd=repo,
+        dry_run=dry_run,
+    )
+
+
+def build_deployment(
+    *,
+    name: str,
+    stage: str,
+    region: str,
+    aws_profile: str | None,
+    expected_account_id: str | None,
+    parameters: dict[str, str],
+    local_repository: str | None,
+    core_version: str | None,
+    core_repository_url: str,
+    source_root: Path,
+    dry_run: bool,
+) -> dict[str, Any]:
+    if local_repository and core_version:
+        raise DeployError("Choose either --repository or --core-version, not both")
+    source = None
+    if core_version:
+        managed_path, source = install_core_source(
+            name=name,
+            version=core_version,
+            repository_url=core_repository_url,
+            root=source_root,
+            runner=run,
+            dry_run=dry_run,
+        )
+        source["root"] = str(source_root.expanduser().resolve())
+        repo = managed_path
+    else:
+        repo = _path(local_repository or Path.cwd())
+    item: dict[str, Any] = {
+        "repository": str(repo),
+        "stage": stage,
+        "region": region,
+        "parameters": parameters,
+    }
+    if aws_profile:
+        item["aws_profile"] = aws_profile
+    if expected_account_id:
+        item["expected_account_id"] = expected_account_id
+    if source:
+        item["source"] = source
+    validate_deployment(item, require_repository=not (dry_run and core_version is not None))
+    return item
+
+
 def deployment_status(name: str, deployment: dict[str, Any]) -> dict[str, Any]:
     response = aws_json(
         deployment,
@@ -524,7 +626,6 @@ def api_request(args: argparse.Namespace, deployment: dict[str, Any]) -> int:
     except json.JSONDecodeError:
         print(raw)
     return 0
-    return env
 
 
 def cmd_installations(args: argparse.Namespace, registry: dict[str, Any], path: Path) -> int:
@@ -535,7 +636,9 @@ def cmd_installations(args: argparse.Namespace, registry: dict[str, Any], path: 
                 "stage": item["stage"],
                 "region": item["region"],
                 "aws_profile": item.get("aws_profile"),
+                "expected_account_id": item.get("expected_account_id"),
                 "repository": item["repository"],
+                "core_version": (item.get("source") or {}).get("version"),
             }
             for name, item in sorted(registry["deployments"].items())
         ]
@@ -557,18 +660,62 @@ def cmd_installations(args: argparse.Namespace, registry: dict[str, Any], path: 
             if value is not None:
                 validate_parameter(key, value)
                 parameters[key] = value
-        item: dict[str, Any] = {
-            "repository": str(_path(args.repository)),
-            "stage": args.stage,
-            "region": args.region,
-            "parameters": parameters,
-        }
-        if args.aws_profile:
-            item["aws_profile"] = args.aws_profile
-        validate_deployment(item)
-        registry["deployments"][name] = item
+        item = build_deployment(
+            name=name,
+            stage=args.stage,
+            region=args.region,
+            aws_profile=args.aws_profile,
+            expected_account_id=args.expected_account_id,
+            parameters=parameters,
+            local_repository=args.repository,
+            core_version=args.core_version,
+            core_repository_url=args.core_repository_url,
+            source_root=_path(args.source_root),
+            dry_run=args.dry_run,
+        )
+        if not args.dry_run:
+            registry["deployments"][name] = item
+            save_registry(path, registry)
+            print(f"Saved deployment {name!r} in {path}")
+        else:
+            print(json.dumps({"name": name, **item}, indent=2, sort_keys=True))
+        return 0
+    if args.installations_command == "versions":
+        item = require_deployment(registry, args.name)
+        source = item.get("source") or {}
+        root = _path(args.source_root or source.get("root") or DEFAULT_SOURCE_ROOT)
+        versions = installed_versions(root, args.name)
+        active = source.get("version")
+        for version in versions:
+            version["active"] = version["version"] == active
+        print(json.dumps(versions, indent=2, sort_keys=True))
+        return 0
+    if args.installations_command == "upgrade":
+        item = require_deployment(registry, args.name)
+        current_source = item.get("source")
+        if not current_source:
+            raise DeployError("A local-repository installation cannot be upgraded automatically")
+        root = _path(args.source_root or current_source.get("root") or DEFAULT_SOURCE_ROOT)
+        repo_url = args.core_repository_url or current_source["repository_url"]
+        managed_path, source = install_core_source(
+            name=args.name,
+            version=args.core_version,
+            repository_url=repo_url,
+            root=root,
+            runner=run,
+            dry_run=args.dry_run,
+        )
+        source["root"] = str(root)
+        updated = {**item, "repository": str(managed_path), "source": source}
+        validate_deployment(updated, require_repository=not args.dry_run)
+        if args.dry_run:
+            print(json.dumps({"name": args.name, **updated}, indent=2, sort_keys=True))
+            return 0
+        registry["deployments"][args.name] = updated
         save_registry(path, registry)
-        print(f"Saved deployment {name!r} in {path}")
+        print(f"Updated {args.name!r} to Core {args.core_version}; previous versions retained")
+        if args.prepare:
+            prepare_deployment(updated, runtime_only=False, skip_submodules=False, dry_run=False)
         return 0
     if args.installations_command == "remove":
         require_deployment(registry, args.name)
@@ -581,6 +728,100 @@ def cmd_installations(args: argparse.Namespace, registry: dict[str, Any], path: 
         print(f"Removed local registry entry {args.name!r}; AWS resources were not changed")
         return 0
     raise DeployError("An installations command is required")
+
+
+def cmd_apply(args: argparse.Namespace, registry: dict[str, Any], registry_path: Path) -> int:
+    config_path = _path(args.file)
+    specs = load_fleet_config(config_path)
+    selected = set(args.select)
+    available = {spec["name"] for spec in specs}
+    missing = selected - available
+    if missing:
+        raise DeployError(f"Selected deployments not found in config: {', '.join(sorted(missing))}")
+    if selected:
+        specs = [spec for spec in specs if spec["name"] in selected]
+
+    resolved: list[tuple[str, dict[str, Any]]] = []
+    failures: list[tuple[str, str]] = []
+    for spec in specs:
+        name = require_name(spec["name"])
+        try:
+            local_repository = spec["repository"]
+            if local_repository and not Path(local_repository).expanduser().is_absolute():
+                local_repository = str((config_path.parent / local_repository).resolve())
+            source_root = spec["source_root"]
+            if source_root and not Path(source_root).expanduser().is_absolute():
+                source_root = str((config_path.parent / source_root).resolve())
+            item = build_deployment(
+                name=name,
+                stage=spec["stage"],
+                region=spec["region"],
+                aws_profile=spec["aws_profile"],
+                expected_account_id=spec["expected_account_id"],
+                parameters=spec["parameters"],
+                local_repository=local_repository,
+                core_version=spec["core_version"],
+                core_repository_url=spec["core_repository_url"] or DEFAULT_CORE_REPOSITORY,
+                source_root=_path(source_root or DEFAULT_SOURCE_ROOT),
+                dry_run=args.dry_run,
+            )
+            resolved.append((name, item))
+        except (DeployError, SourceError, subprocess.CalledProcessError) as exc:
+            failures.append((name, str(exc)))
+            print(f"FAIL  {name}: {exc}", file=sys.stderr)
+            if not args.continue_on_error:
+                return 1
+
+    if not args.dry_run:
+        for name, item in resolved:
+            registry["deployments"][name] = item
+        save_registry(registry_path, registry)
+
+    for name, item in resolved:
+        try:
+            if args.prepare:
+                prepare_deployment(
+                    item,
+                    runtime_only=args.runtime_only,
+                    skip_submodules=args.skip_submodules,
+                    dry_run=args.dry_run,
+                )
+            if args.deploy:
+                if not args.dry_run:
+                    verify_expected_account(item)
+                artifact = package_deployment(
+                    name,
+                    item,
+                    None,
+                    _path(args.artifact_root),
+                    dry_run=args.dry_run,
+                    allow_dirty=args.allow_dirty,
+                )
+                deploy_artifact(
+                    name,
+                    item,
+                    artifact,
+                    allow_downgrade=args.allow_protection_downgrade,
+                    dry_run=args.dry_run,
+                )
+            print(f"PASS  {name}")
+        except (DeployError, SourceError, subprocess.CalledProcessError) as exc:
+            failures.append((name, str(exc)))
+            print(f"FAIL  {name}: {exc}", file=sys.stderr)
+            if not args.continue_on_error:
+                return 1
+
+    print(
+        json.dumps(
+            {
+                "configured": [name for name, _item in resolved],
+                "failed": [{"name": name, "error": error} for name, error in failures],
+                "dry_run": args.dry_run,
+            },
+            indent=2,
+        )
+    )
+    return 1 if failures else 0
 
 
 def cmd_features(
@@ -601,6 +842,8 @@ def cmd_features(
     save_registry(registry_path, registry)
     print(f"Updated desired parameters for {name!r}")
     if args.deploy:
+        if not args.dry_run:
+            verify_expected_account(deployment)
         artifact = package_deployment(
             name,
             deployment,
@@ -633,8 +876,12 @@ def cmd_doctor(deployment: dict[str, Any]) -> int:
     if shutil.which("aws"):
         try:
             value = aws_json(deployment, ["sts", "get-caller-identity"])
-            credentials_ok = True
-            identity = f"account={value.get('Account')} arn={value.get('Arn')}"
+            actual = str(value.get("Account", ""))
+            expected = deployment.get("expected_account_id")
+            credentials_ok = not expected or actual == expected
+            identity = f"account={actual} arn={value.get('Arn')}"
+            if expected:
+                identity += f" expected_account={expected}"
         except (subprocess.CalledProcessError, json.JSONDecodeError):
             pass
     checks.append(("AWS credentials", credentials_ok, identity))
@@ -662,18 +909,47 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("name")
     add = installation_commands.add_parser("add")
     add.add_argument("name")
-    add.add_argument("--repository", default=str(Path.cwd()))
+    source = add.add_mutually_exclusive_group()
+    source.add_argument("--repository", help="existing local Core checkout")
+    source.add_argument("--core-version", help="managed immutable Core tag, e.g. v1.2.1")
+    add.add_argument("--core-repository-url", default=DEFAULT_CORE_REPOSITORY)
+    add.add_argument("--source-root", default=str(DEFAULT_SOURCE_ROOT))
     add.add_argument("--stage", required=True)
     add.add_argument("--region", default="us-east-1")
     add.add_argument("--aws-profile")
+    add.add_argument("--expected-account-id")
     add.add_argument("--archive", choices=("true", "false"))
     add.add_argument("--xray", choices=("true", "false"))
     add.add_argument("--security-profile", choices=("standard", "hardened"))
     add.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
     add.add_argument("--replace", action="store_true")
+    add.add_argument("--dry-run", action="store_true")
+    versions = installation_commands.add_parser("versions")
+    versions.add_argument("name")
+    versions.add_argument("--source-root")
+    upgrade = installation_commands.add_parser("upgrade")
+    upgrade.add_argument("name")
+    upgrade.add_argument("--core-version", required=True)
+    upgrade.add_argument("--core-repository-url")
+    upgrade.add_argument("--source-root")
+    upgrade.add_argument("--prepare", action="store_true")
+    upgrade.add_argument("--dry-run", action="store_true")
     remove = installation_commands.add_parser("remove")
     remove.add_argument("name")
     remove.add_argument("--yes", action="store_true")
+
+    apply = commands.add_parser("apply", help="reconcile one or more deployments from TOML")
+    apply.add_argument("--file", required=True, type=Path)
+    apply.add_argument("--select", action="append", default=[], metavar="NAME")
+    apply.add_argument("--prepare", action="store_true")
+    apply.add_argument("--deploy", action="store_true")
+    apply.add_argument("--runtime-only", action="store_true")
+    apply.add_argument("--skip-submodules", action="store_true")
+    apply.add_argument("--continue-on-error", action="store_true")
+    apply.add_argument("--allow-protection-downgrade", action="store_true")
+    apply.add_argument("--allow-dirty", action="store_true")
+    apply.add_argument("--artifact-root", default=str(DEFAULT_ARTIFACT_ROOT))
+    apply.add_argument("--dry-run", action="store_true")
 
     commands.add_parser("doctor", help="validate local tools and AWS identity")
     prepare = commands.add_parser("prepare", help="install locked local dependencies")
@@ -736,6 +1012,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         registry = load_registry(registry_path)
         if args.command == "installations":
             return cmd_installations(args, registry, registry_path)
+        if args.command == "apply":
+            return cmd_apply(args, registry, registry_path)
         if not args.deployment:
             raise DeployError(f"{args.command!r} requires --deployment NAME")
         name = require_name(args.deployment)
@@ -745,28 +1023,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "doctor":
             return cmd_doctor(deployment)
         if args.command == "prepare":
-            if not args.skip_submodules:
-                run(
-                    ["git", "submodule", "update", "--init", "--recursive"],
-                    cwd=repo,
-                    env=deployment_env(deployment),
-                    dry_run=args.dry_run,
-                )
-            run(["npm", "ci"], cwd=repo, env=deployment_env(deployment), dry_run=args.dry_run)
-            python = shutil.which("python3.12")
-            if not python:
-                raise DeployError("Python 3.12 was not found")
-            run([python, "-m", "venv", ".venv"], cwd=repo, dry_run=args.dry_run)
-            requirements = "requirements.txt" if args.runtime_only else "requirements-dev.txt"
-            run(
-                [
-                    str(repo / ".venv" / "bin" / "pip"),
-                    "install",
-                    "--require-hashes",
-                    "-r",
-                    requirements,
-                ],
-                cwd=repo,
+            prepare_deployment(
+                deployment,
+                runtime_only=args.runtime_only,
+                skip_submodules=args.skip_submodules,
                 dry_run=args.dry_run,
             )
             return 0
@@ -781,6 +1041,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if args.command == "deploy":
+            if not args.dry_run:
+                verify_expected_account(deployment)
             artifact = args.artifact or package_deployment(
                 name,
                 deployment,
@@ -798,6 +1060,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if args.command == "status":
+            verify_expected_account(deployment)
             print(json.dumps(deployment_status(name, deployment), indent=2, sort_keys=True))
             return 0
         if args.command == "features":
@@ -814,6 +1077,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if script.name in API_SCRIPTS and not args.dry_run
                 else deployment_env(deployment)
             )
+            if not args.dry_run:
+                verify_expected_account(deployment)
             run(
                 [*script_command(repo, script), *arguments],
                 cwd=repo,
@@ -823,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         if args.command == "api":
+            verify_expected_account(deployment)
             if args.api_command == "request":
                 if args.file and args.data:
                     raise DeployError("--file and --data are mutually exclusive")
@@ -840,7 +1106,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except APIResponseError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except DeployError as exc:
+    except (DeployError, FleetConfigError, SourceError) as exc:
         parser.error(str(exc))
     except subprocess.CalledProcessError as exc:
         return exc.returncode or 1

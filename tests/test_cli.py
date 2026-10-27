@@ -80,6 +80,73 @@ def test_environment_isolated_by_profile_and_region():
     assert env["AWS_DEFAULT_REGION"] == "eu-west-1"
 
 
+def test_expected_account_guard_fails_closed(monkeypatch):
+    item = deployment()
+    item["expected_account_id"] = "111111111111"
+    monkeypatch.setattr(
+        deploy,
+        "aws_json",
+        lambda *_args, **_kwargs: {"Account": "222222222222"},
+    )
+    with pytest.raises(deploy.DeployError, match="AWS account mismatch"):
+        deploy.verify_expected_account(item)
+
+
+def test_apply_registers_multiple_local_installations(tmp_path):
+    registry = tmp_path / "registry.json"
+    config = tmp_path / "fleet.toml"
+    config.write_text(
+        f"""
+version = 1
+
+[defaults]
+repository = "{ROOT}"
+region = "us-east-1"
+
+[[deployments]]
+name = "account-a"
+stage = "prod"
+aws_profile = "account-a"
+expected_account_id = "111111111111"
+
+[[deployments]]
+name = "account-b"
+stage = "staging"
+aws_profile = "account-b"
+expected_account_id = "222222222222"
+
+[deployments.features]
+archive = false
+"""
+    )
+
+    assert deploy.main(["--registry", str(registry), "apply", "--file", str(config)]) == 0
+    stored = deploy.load_registry(registry)["deployments"]
+    assert set(stored) == {"account-a", "account-b"}
+    assert stored["account-a"]["aws_profile"] == "account-a"
+    assert stored["account-b"]["parameters"]["archiveEnabled"] == "false"
+
+
+def test_apply_dry_run_does_not_write_registry(tmp_path):
+    registry = tmp_path / "registry.json"
+    config = tmp_path / "fleet.toml"
+    config.write_text(
+        f"""
+version = 1
+
+[[deployments]]
+name = "production"
+stage = "prod"
+region = "us-east-1"
+repository = "{ROOT}"
+"""
+    )
+    assert (
+        deploy.main(["--registry", str(registry), "apply", "--file", str(config), "--dry-run"]) == 0
+    )
+    assert not registry.exists()
+
+
 def test_deployment_validation_rejects_invalid_region():
     item = deployment()
     item["region"] = "not a region"
