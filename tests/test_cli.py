@@ -26,6 +26,71 @@ def test_cli_reports_package_version(capsys):
     assert capsys.readouterr().out.strip().endswith(f" {opencdr_deploy.__version__}")
 
 
+def test_mcp_install_uses_current_python_and_exact_version(monkeypatch, capsys):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(deploy, "run", fake_run)
+    monkeypatch.setattr(deploy, "installed_mcp_version", lambda: "0.1.0")
+    monkeypatch.setattr(deploy, "mcp_executable", lambda: "/venv/bin/opencdr-mcp")
+
+    assert deploy.main(["mcp", "install", "--version", "0.1.0", "--upgrade"]) == 0
+    command, kwargs = calls[0]
+    assert command == [
+        deploy.sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--upgrade",
+        "opencdr-mcp==0.1.0",
+    ]
+    assert kwargs["cwd"] == Path.cwd()
+    assert "Installed opencdr-mcp 0.1.0" in capsys.readouterr().out
+
+
+def test_mcp_install_dry_run_does_not_verify_install(monkeypatch, capsys):
+    monkeypatch.setattr(
+        deploy,
+        "installed_mcp_version",
+        lambda: pytest.fail("dry-run must not inspect an installation"),
+    )
+    assert deploy.main(["mcp", "install", "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert f"{deploy.sys.executable} -m pip install" in output
+    assert output.rstrip().endswith("opencdr-mcp")
+
+
+def test_mcp_install_rejects_unsafe_version():
+    with pytest.raises(deploy.DeployError, match="unsupported characters"):
+        deploy.mcp_package_spec("0.1.0 /tmp/package")
+
+
+def test_mcp_status_reports_absent_package(monkeypatch, capsys):
+    monkeypatch.setattr(deploy, "installed_mcp_version", lambda: None)
+    assert deploy.main(["mcp", "status"]) == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "executable": None,
+        "installed": False,
+        "python": deploy.sys.executable,
+        "version": None,
+    }
+
+
+def test_mcp_status_reports_package_and_executable(monkeypatch, capsys):
+    monkeypatch.setattr(deploy, "installed_mcp_version", lambda: "0.1.0")
+    monkeypatch.setattr(deploy, "mcp_executable", lambda: "/venv/bin/opencdr-mcp")
+    assert deploy.main(["mcp", "status"]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["installed"] is True
+    assert status["version"] == "0.1.0"
+    assert status["executable"] == "/venv/bin/opencdr-mcp"
+
+
 def deployment(repo: Path = ROOT):
     return {
         "repository": str(repo),

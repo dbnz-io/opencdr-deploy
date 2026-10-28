@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -55,6 +56,9 @@ SCRIPT_CONTEXT: dict[str, list[tuple[str, str]]] = {
     ],
 }
 API_SCRIPTS = {"opencdr.py", "check_s3_ingestion.py"}
+MCP_DISTRIBUTION = "opencdr-mcp"
+MCP_EXECUTABLE = "opencdr-mcp"
+MCP_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+!-]*$")
 
 
 class DeployError(RuntimeError):
@@ -891,6 +895,78 @@ def cmd_doctor(deployment: dict[str, Any]) -> int:
     return 0 if all(success for _, success, _ in checks) else 1
 
 
+def installed_mcp_version() -> str | None:
+    """Return the installed companion MCP package version, if present."""
+    try:
+        return importlib.metadata.version(MCP_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def mcp_executable() -> str | None:
+    """Find the MCP console script, including beside this Python interpreter."""
+    discovered = shutil.which(MCP_EXECUTABLE)
+    if discovered:
+        return discovered
+    adjacent = Path(sys.executable).parent / MCP_EXECUTABLE
+    return str(adjacent) if adjacent.is_file() else None
+
+
+def mcp_package_spec(version: str | None) -> str:
+    if version is None:
+        return MCP_DISTRIBUTION
+    if not MCP_VERSION_RE.fullmatch(version):
+        raise DeployError("MCP version contains unsupported characters")
+    return f"{MCP_DISTRIBUTION}=={version}"
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    if args.mcp_command == "status":
+        version = installed_mcp_version()
+        executable = mcp_executable() if version else None
+        print(
+            json.dumps(
+                {
+                    "installed": version is not None,
+                    "version": version,
+                    "executable": executable,
+                    "python": sys.executable,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0 if version and executable else 1
+
+    package = mcp_package_spec(args.version)
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+    ]
+    if args.upgrade:
+        command.append("--upgrade")
+    command.append(package)
+    run(command, cwd=Path.cwd(), dry_run=args.dry_run)
+    if args.dry_run:
+        return 0
+
+    version = installed_mcp_version()
+    if version is None:
+        raise DeployError("pip completed but opencdr-mcp is not installed in this environment")
+    executable = mcp_executable()
+    if executable is None:
+        raise DeployError(
+            "opencdr-mcp is installed but its console script was not found; "
+            f"ensure {Path(sys.executable).parent} is on PATH"
+        )
+    print(f"Installed {MCP_DISTRIBUTION} {version}: {executable}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -950,6 +1026,16 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--allow-dirty", action="store_true")
     apply.add_argument("--artifact-root", default=str(DEFAULT_ARTIFACT_ROOT))
     apply.add_argument("--dry-run", action="store_true")
+
+    mcp = commands.add_parser("mcp", help="install or inspect the optional OpenCDR MCP client")
+    mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_install = mcp_commands.add_parser(
+        "install", help="install opencdr-mcp into this Python environment"
+    )
+    mcp_install.add_argument("--version", help="install an exact PyPI version")
+    mcp_install.add_argument("--upgrade", action="store_true", help="upgrade an existing install")
+    mcp_install.add_argument("--dry-run", action="store_true")
+    mcp_commands.add_parser("status", help="show the installed MCP package and executable")
 
     commands.add_parser("doctor", help="validate local tools and AWS identity")
     prepare = commands.add_parser("prepare", help="install locked local dependencies")
@@ -1014,6 +1100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_installations(args, registry, registry_path)
         if args.command == "apply":
             return cmd_apply(args, registry, registry_path)
+        if args.command == "mcp":
+            return cmd_mcp(args)
         if not args.deployment:
             raise DeployError(f"{args.command!r} requires --deployment NAME")
         name = require_name(args.deployment)

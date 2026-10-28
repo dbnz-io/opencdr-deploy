@@ -20,6 +20,31 @@ Python 3.11 or newer is required. Deploying Core also requires the tools used by
 that Core release: AWS CLI, Node/npm, Serverless Framework, Docker, `jq`, and
 Python 3.12. `opencdr-deploy doctor` checks the selected installation.
 
+## Install the optional MCP client
+
+OpenCDR's MCP management server is distributed independently and is not required
+by Core. Install it into the same Python environment as `opencdr-deploy`:
+
+```bash
+opencdr-deploy mcp install
+opencdr-deploy mcp status
+
+# Upgrade to the latest published release, or select an exact version.
+opencdr-deploy mcp install --upgrade
+opencdr-deploy mcp install --version 0.1.0
+```
+
+This also works when `opencdr-deploy` was installed with `pipx`: the MCP package
+is injected into the deployment manager's isolated environment, and the
+`opencdr-mcp` executable is placed beside `opencdr-deploy`. Use `--dry-run` to
+show the exact pip command without changing the environment.
+
+The MCP package can manage any OpenCDR deployment, but it still needs that
+deployment's API URL and a suitably scoped API key. Installation does not read
+credentials from the deployment registry or silently configure an MCP client.
+See the [opencdr-mcp documentation](https://github.com/dbnz-io/opencdr-mcp) for
+profiles and client registration.
+
 For local development:
 
 ```bash
