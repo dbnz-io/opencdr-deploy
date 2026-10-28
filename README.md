@@ -211,23 +211,30 @@ Serverless parameters can be registered without upgrading this tool:
 "${DEPLOY[@]}" features set futureFeature=enabled
 ```
 
-## Run Core operational scripts
+## Operate Core
 
-The selected Core checkout remains responsible for version-coupled operational
-scripts. The manager discovers all `.py` and `.sh` entry points under its
-`scripts/` directory, supplies the correct AWS profile/region, and injects the
-stage/region options for known scripts.
+`opencdr-deploy` is the supported operator interface. It selects the correct
+Core release, AWS profile, account, region, and stage before invoking a
+version-compatible workflow:
 
 ```bash
-"${DEPLOY[@]}" scripts list
-"${DEPLOY[@]}" scripts run load_rules.sh -- --dry-run
-"${DEPLOY[@]}" scripts run test_deployed.sh -- --event 009
-"${DEPLOY[@]}" scripts run setup_region_forwarding.sh -- --regions eu-west-2
-"${DEPLOY[@]}" scripts run cost_report.sh -- --granularity MONTHLY
+"${DEPLOY[@]}" catalog load --dry-run
+"${DEPLOY[@]}" test local --event 009
+"${DEPLOY[@]}" test deployed --event 009
+"${DEPLOY[@]}" coverage regions --regions eu-west-2
+"${DEPLOY[@]}" coverage accounts --profiles member-a,member-b
+"${DEPLOY[@]}" cost --granularity MONTHLY
+"${DEPLOY[@]}" ingestion canary falco-production
 ```
 
-Explicit script arguments override injected values. Child arguments are
-concealed in manager logs because operational commands can contain secrets.
+Arguments supplied by the operator override injected stage/region values.
+Child arguments are concealed in manager logs because operational commands can
+contain secrets. The implementations remain in the selected Core release during
+the compatibility period so an older deployment always runs matching logic.
+
+`scripts list` and `scripts run` remain as deprecated compatibility escape
+hatches. Direct execution of scripts from a Core checkout is also deprecated;
+it will be removed only in a separately announced major Core release.
 
 ## Manage the complete REST API
 
@@ -263,12 +270,16 @@ for secrets so they do not appear in process arguments. Absolute URLs are
 rejected so a deployment's API key cannot be redirected to another host.
 HTTP failures return a nonzero exit status.
 
-For the selected Core version's friendly API commands:
+For friendly API commands, use the top-level `manage` command:
 
 ```bash
-"${DEPLOY[@]}" api core-cli -- rules list --kind signal
-"${DEPLOY[@]}" api core-cli -- settings get
+"${DEPLOY[@]}" manage rules list --kind signal
+"${DEPLOY[@]}" manage lists list
+"${DEPLOY[@]}" manage settings get
+"${DEPLOY[@]}" manage ir-actions list
 ```
+
+`api core-cli` remains as a deprecated alias during the compatibility period.
 
 ## Security and responsibility boundary
 

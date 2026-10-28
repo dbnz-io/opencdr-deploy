@@ -530,6 +530,68 @@ def context_arguments(script: str, deployment: dict[str, Any], arguments: list[s
     return [*injected, *arguments]
 
 
+def child_arguments(arguments: list[str]) -> list[str]:
+    """Remove argparse's optional separator before forwarding child arguments."""
+    return arguments[1:] if arguments[:1] == ["--"] else arguments
+
+
+def normalize_operator_argv(argv: Sequence[str] | None) -> list[str]:
+    """Insert argparse's separator while preserving workflow argument order."""
+    values = list(sys.argv[1:] if argv is None else argv)
+    index = 0
+    while index < len(values):
+        if values[index] in {"--registry", "--deployment"}:
+            index += 2
+            continue
+        if values[index] == "--version":
+            return values
+        break
+    if index >= len(values):
+        return values
+
+    command = values[index]
+    direct = {"manage", "cost"}
+    nested = {"catalog", "test", "coverage", "ingestion"}
+    separator = index + 1 if command in direct else index + 2
+    if command in nested and separator > len(values):
+        return values
+    if command in direct | nested and separator < len(values) and values[separator] != "--":
+        values.insert(separator, "--")
+    return values
+
+
+def run_operational_workflow(
+    deployment: dict[str, Any],
+    script_name: str,
+    arguments: list[str],
+    *,
+    prefix: Sequence[str] = (),
+    needs_api: bool = False,
+    verify_account: bool = True,
+    dry_run: bool = False,
+) -> int:
+    """Run a version-coupled Core workflow behind the stable deployer CLI."""
+    repo = repository(deployment)
+    script = resolve_script(repo, script_name)
+    forwarded = context_arguments(script.name, deployment, [*prefix, *child_arguments(arguments)])
+    if verify_account and not dry_run:
+        verify_expected_account(deployment)
+    env = (
+        api_environment(deployment)
+        if needs_api and not dry_run
+        else deployment_env(deployment)
+    )
+    env["OPENCDR_DEPLOY_WRAPPED"] = "1"
+    run(
+        [*script_command(repo, script), *forwarded],
+        cwd=repo,
+        env=env,
+        dry_run=dry_run,
+        conceal_arguments=True,
+    )
+    return 0
+
+
 def api_environment(deployment: dict[str, Any]) -> dict[str, str]:
     env = deployment_env(deployment)
     for suffix, variable, decrypt in (
@@ -1068,7 +1130,49 @@ def build_parser() -> argparse.ArgumentParser:
     feature_set.add_argument("--allow-dirty", action="store_true")
     feature_set.add_argument("--dry-run", action="store_true")
 
-    scripts = commands.add_parser("scripts", help="run repository operational scripts")
+    manage = commands.add_parser(
+        "manage", help="manage rules, lists, settings, signals, logs and response actions"
+    )
+    manage.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    catalog = commands.add_parser("catalog", help="manage the detection-rule catalog")
+    catalog_commands = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_load = catalog_commands.add_parser("load", help="load the selected Core rule catalog")
+    catalog_load.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    test = commands.add_parser("test", help="run Core detection and deployment checks")
+    test_commands = test.add_subparsers(dest="test_command", required=True)
+    test_local = test_commands.add_parser("local", help="evaluate catalog rules locally")
+    test_local.add_argument("arguments", nargs=argparse.REMAINDER)
+    test_deployed = test_commands.add_parser(
+        "deployed", help="replay fixtures through the selected deployment"
+    )
+    test_deployed.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    coverage = commands.add_parser("coverage", help="manage regional/account event coverage")
+    coverage_commands = coverage.add_subparsers(dest="coverage_command", required=True)
+    coverage_regions = coverage_commands.add_parser(
+        "regions", help="configure same-account regional event forwarding"
+    )
+    coverage_regions.add_argument("arguments", nargs=argparse.REMAINDER)
+    coverage_accounts = coverage_commands.add_parser(
+        "accounts", help="configure the legacy centralized account-forwarding topology"
+    )
+    coverage_accounts.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    cost = commands.add_parser("cost", help="report tagged AWS spend for the selected stage")
+    cost.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    ingestion = commands.add_parser("ingestion", help="operate optional ingestion features")
+    ingestion_commands = ingestion.add_subparsers(dest="ingestion_command", required=True)
+    ingestion_canary = ingestion_commands.add_parser(
+        "canary", help="run the S3 ingestion staging canary"
+    )
+    ingestion_canary.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    scripts = commands.add_parser(
+        "scripts", help="deprecated compatibility escape hatch for Core scripts"
+    )
     script_commands = scripts.add_subparsers(dest="scripts_command", required=True)
     script_commands.add_parser("list")
     script_run = script_commands.add_parser("run")
@@ -1085,14 +1189,16 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--file", help="JSON request body file, or - for stdin")
     request.add_argument("--data", help="inline JSON request body")
     request.add_argument("--timeout", type=float, default=30.0)
-    core_cli = api_commands.add_parser("core-cli", help="run this Core version's friendly API CLI")
+    core_cli = api_commands.add_parser(
+        "core-cli", help="deprecated alias for the top-level manage command"
+    )
     core_cli.add_argument("arguments", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(normalize_operator_argv(argv))
     registry_path = _path(args.registry)
     try:
         registry = load_registry(registry_path)
@@ -1153,12 +1259,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "features":
             return cmd_features(args, registry, registry_path, name, deployment)
+        if args.command == "manage":
+            return run_operational_workflow(
+                deployment,
+                "opencdr.py",
+                args.arguments,
+                needs_api=True,
+            )
+        if args.command == "catalog":
+            return run_operational_workflow(deployment, "load_rules.sh", args.arguments)
+        if args.command == "test":
+            if args.test_command == "local":
+                return run_operational_workflow(
+                    deployment,
+                    "opencdr.py",
+                    args.arguments,
+                    prefix=("test", "local"),
+                    verify_account=False,
+                )
+            return run_operational_workflow(deployment, "test_deployed.sh", args.arguments)
+        if args.command == "coverage":
+            script = (
+                "setup_region_forwarding.sh"
+                if args.coverage_command == "regions"
+                else "setup_org_forwarding.sh"
+            )
+            return run_operational_workflow(deployment, script, args.arguments)
+        if args.command == "cost":
+            return run_operational_workflow(deployment, "cost_report.sh", args.arguments)
+        if args.command == "ingestion":
+            return run_operational_workflow(
+                deployment,
+                "check_s3_ingestion.py",
+                args.arguments,
+                needs_api=True,
+            )
         if args.command == "scripts":
             if args.scripts_command == "list":
                 print("\n".join(available_scripts(repo)))
                 return 0
             script = resolve_script(repo, args.script)
-            arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+            arguments = child_arguments(args.arguments)
             arguments = context_arguments(script.name, deployment, arguments)
             env = (
                 api_environment(deployment)
@@ -1181,15 +1322,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.file and args.data:
                     raise DeployError("--file and --data are mutually exclusive")
                 return api_request(args, deployment)
-            arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-            script = repo / "scripts" / "opencdr.py"
-            run(
-                [*script_command(repo, script), *arguments],
-                cwd=repo,
-                env=api_environment(deployment),
-                conceal_arguments=True,
+            print(
+                "WARNING: 'api core-cli' is deprecated; use 'manage' instead.",
+                file=sys.stderr,
             )
-            return 0
+            return run_operational_workflow(
+                deployment,
+                "opencdr.py",
+                args.arguments,
+                needs_api=True,
+            )
         raise DeployError(f"Unsupported command: {args.command}")
     except APIResponseError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

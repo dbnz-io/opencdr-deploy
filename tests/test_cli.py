@@ -403,6 +403,133 @@ def test_deployment_manager_core_cli_conceals_child_arguments(tmp_path, monkeypa
     assert kwargs["conceal_arguments"] is True
 
 
+def test_manage_is_first_class_alias_for_core_management_cli(tmp_path, monkeypatch):
+    registry = tmp_path / "deployments.json"
+    deploy.save_registry(registry, {"version": 1, "deployments": {"customer-a": deployment()}})
+    calls = []
+    monkeypatch.setattr(deploy, "api_environment", lambda _deployment: {"API": "configured"})
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(deploy, "run", fake_run)
+    result = deploy.main(
+        [
+            "--registry",
+            str(registry),
+            "--deployment",
+            "customer-a",
+            "manage",
+            "rules",
+            "list",
+            "--kind",
+            "signal",
+        ]
+    )
+
+    assert result == 0
+    command, kwargs = calls[0]
+    assert command[-4:] == ["rules", "list", "--kind", "signal"]
+    assert kwargs["env"] == {"API": "configured", "OPENCDR_DEPLOY_WRAPPED": "1"}
+    assert kwargs["conceal_arguments"] is True
+
+
+def test_catalog_load_injects_selected_stage_and_region(tmp_path, monkeypatch):
+    registry = tmp_path / "deployments.json"
+    deploy.save_registry(registry, {"version": 1, "deployments": {"customer-a": deployment()}})
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(deploy, "run", fake_run)
+    assert (
+        deploy.main(
+            [
+                "--registry",
+                str(registry),
+                "--deployment",
+                "customer-a",
+                "catalog",
+                "load",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    command, kwargs = calls[0]
+    assert command[-5:] == ["--stage", "prod", "--region", "eu-west-1", "--dry-run"]
+    assert kwargs["conceal_arguments"] is True
+
+
+def test_management_workflow_verifies_account_before_reading_api_secret(monkeypatch):
+    order = []
+    monkeypatch.setattr(deploy, "verify_expected_account", lambda _item: order.append("verify"))
+    monkeypatch.setattr(
+        deploy,
+        "api_environment",
+        lambda _item: order.append("credentials") or {},
+    )
+    monkeypatch.setattr(
+        deploy,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    deploy.run_operational_workflow(deployment(), "opencdr.py", ["status"], needs_api=True)
+
+    assert order == ["verify", "credentials"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--deployment", "x", "manage"],
+        ["--deployment", "x", "catalog", "load"],
+        ["--deployment", "x", "test", "local"],
+        ["--deployment", "x", "test", "deployed"],
+        ["--deployment", "x", "coverage", "regions"],
+        ["--deployment", "x", "coverage", "accounts"],
+        ["--deployment", "x", "cost"],
+        ["--deployment", "x", "ingestion", "canary", "integration-id"],
+    ],
+)
+def test_operator_workflow_commands_parse(argv):
+    assert deploy.build_parser().parse_args(argv).command in {
+        "manage",
+        "catalog",
+        "test",
+        "coverage",
+        "cost",
+        "ingestion",
+    }
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (
+            ["--deployment", "x", "test", "local", "--event", "009", "--rule", "abc"],
+            ["--event", "009", "--rule", "abc"],
+        ),
+        (
+            ["--deployment", "x", "coverage", "regions", "--regions", "eu-west-1"],
+            ["--regions", "eu-west-1"],
+        ),
+        (
+            ["--deployment", "x", "cost", "--granularity", "MONTHLY"],
+            ["--granularity", "MONTHLY"],
+        ),
+    ],
+)
+def test_operator_workflow_argument_order_is_preserved(argv, expected):
+    parser = deploy.build_parser()
+    args = parser.parse_args(deploy.normalize_operator_argv(argv))
+    assert deploy.child_arguments(args.arguments) == expected
+
+
 class _Response:
     def __init__(self, body: str):
         self.body = body
