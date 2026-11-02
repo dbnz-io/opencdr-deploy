@@ -352,6 +352,31 @@ def test_live_status_includes_feature_outputs(monkeypatch):
     assert status["deployed_xray_enabled"] is True
 
 
+def test_live_status_does_not_guess_missing_feature_outputs(monkeypatch):
+    responses = iter(
+        [
+            {
+                "Stacks": [
+                    {
+                        "StackStatus": "UPDATE_COMPLETE",
+                        "Outputs": [
+                            {"OutputKey": "CoreVersion", "OutputValue": "1.2.1"},
+                            {"OutputKey": "ArchiveEnabled", "OutputValue": ""},
+                        ],
+                    }
+                ]
+            },
+            {"Account": "123456789012"},
+        ]
+    )
+    monkeypatch.setattr(deploy, "aws_json", lambda *_args, **_kwargs: next(responses))
+    status = deploy.deployment_status("customer-a", deployment())
+    assert status["deployed_core_version"] == "1.2.1"
+    assert status["deployed_archive_enabled"] is None
+    assert status["deployed_xray_enabled"] is None
+    assert status["deployed_security_profile"] is None
+
+
 def test_api_environment_reads_selected_deployment_ssm_parameters(monkeypatch):
     commands = []
 

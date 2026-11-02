@@ -8,10 +8,16 @@ profile or account, region, stage, and feature set.
 The tool is an orchestrator, not a second infrastructure engine. OpenCDR Core's
 `serverless.yml` remains the infrastructure source of truth.
 
+**Updating a deployment from the platform?** Start with the
+[SOC operator walkthrough](https://github.com/dbnz-io/opencdr-deploy/blob/main/docs/operator-walkthrough.md). It gives one sequence
+of commands, expected results and troubleshooting, without requiring a Core clone.
+
 ## Install
 
 ```bash
-python3 -m pip install opencdr-deploy
+python3 -m venv "$HOME/.opencdr-tools"
+. "$HOME/.opencdr-tools/bin/activate"
+python -m pip install --upgrade 'opencdr-deploy>=0.5.0'
 opencdr-deploy --help
 opencdr-deploy --version
 ```
@@ -19,6 +25,8 @@ opencdr-deploy --version
 Python 3.11 or newer is required. Deploying Core also requires the tools used by
 that Core release: AWS CLI, Node/npm, Serverless Framework, Docker, `jq`, and
 Python 3.12. `opencdr-deploy doctor` checks the selected installation.
+In each new terminal, run `. "$HOME/.opencdr-tools/bin/activate"` to use the
+installed tool. These shell commands apply to macOS/Linux or Windows WSL.
 
 ## Install the optional MCP client
 
@@ -191,6 +199,26 @@ another installation, dirty source trees, and unacknowledged
 
 For development only, `--allow-dirty` permits packaging uncommitted source and
 records that fact in the artifact manifest. `--dry-run` is non-mutating.
+
+## Apply an update downloaded from the platform
+
+Start with the [SOC operator walkthrough](https://github.com/dbnz-io/opencdr-deploy/blob/main/docs/operator-walkthrough.md). It covers
+installation, AWS sign-in, checking the account, downloading Core, checking the
+workstation, deploying and verifying the result. Each step says what to expect
+and what to do if it fails.
+
+The platform prepares a configuration file and matching instructions. You run
+opencdr-deploy on your approved deployment workstation using your existing AWS
+profile. There are no platform deployment roles, OIDC setup or platform-triggered
+infrastructure updates. You do not need a separate Core clone.
+
+`--dry-run` previews local configuration/source work. It does not check AWS
+permissions or generate a CloudFormation change set. Running `apply` without
+`--deploy` downloads/registers Core locally and does not deploy AWS resources.
+
+For an existing local installation, keep its registered name. Version 0.5.0
+also rejects account/region/stage name collisions and
+duplicate registrations for the same known AWS deployment before source changes.
 
 ## Manage features
 

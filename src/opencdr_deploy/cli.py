@@ -490,9 +490,18 @@ def deployment_status(name: str, deployment: dict[str, Any]) -> dict[str, Any]:
         "region": deployment["region"],
         "aws_profile": deployment.get("aws_profile"),
         "configured_parameters": deployment.get("parameters", {}),
-        "deployed_security_profile": outputs.get("CoreSecurityProfile", "standard"),
-        "deployed_archive_enabled": outputs.get("ArchiveEnabled", "true") == "true",
-        "deployed_xray_enabled": outputs.get("XRayEnabled", "true") == "true",
+        "deployed_core_version": outputs.get("CoreVersion"),
+        "deployed_security_profile": outputs.get("CoreSecurityProfile"),
+        "deployed_archive_enabled": (
+            outputs["ArchiveEnabled"] == "true"
+            if outputs.get("ArchiveEnabled") in {"true", "false"}
+            else None
+        ),
+        "deployed_xray_enabled": (
+            outputs["XRayEnabled"] == "true"
+            if outputs.get("XRayEnabled") in {"true", "false"}
+            else None
+        ),
         "service_endpoint": outputs.get("ServiceEndpoint"),
     }
 
@@ -576,11 +585,7 @@ def run_operational_workflow(
     forwarded = context_arguments(script.name, deployment, [*prefix, *child_arguments(arguments)])
     if verify_account and not dry_run:
         verify_expected_account(deployment)
-    env = (
-        api_environment(deployment)
-        if needs_api and not dry_run
-        else deployment_env(deployment)
-    )
+    env = api_environment(deployment) if needs_api and not dry_run else deployment_env(deployment)
     env["OPENCDR_DEPLOY_WRAPPED"] = "1"
     run(
         [*script_command(repo, script), *forwarded],
@@ -796,6 +801,39 @@ def cmd_installations(args: argparse.Namespace, registry: dict[str, Any], path: 
     raise DeployError("An installations command is required")
 
 
+def check_fleet_registry_bindings(specs: list[dict[str, Any]], registry: dict[str, Any]) -> None:
+    """Keep a copied fleet file from redirecting an existing local installation."""
+    for spec in specs:
+        name = require_name(spec["name"])
+        existing = registry["deployments"].get(name)
+        if existing:
+            fields = ("stage", "region", "expected_account_id")
+            if any(
+                existing.get(key) is not None and existing[key] != spec.get(key) for key in fields
+            ):
+                raise DeployError(
+                    f"Installation {name!r} already refers to a different AWS account, region "
+                    "or stage. Correct the name/configuration before applying; no AWS "
+                    "resources were changed."
+                )
+        account = spec.get("expected_account_id")
+        if account:
+            matches = [
+                other_name
+                for other_name, other in registry["deployments"].items()
+                if other_name != name
+                and other.get("expected_account_id") == account
+                and other.get("region") == spec["region"]
+                and other.get("stage") == spec["stage"]
+            ]
+            if matches:
+                raise DeployError(
+                    f"This AWS deployment is already registered as {', '.join(matches)!r}. "
+                    "Use its existing name in the platform's Name in opencdr-deploy field "
+                    "and download a new file."
+                )
+
+
 def cmd_apply(args: argparse.Namespace, registry: dict[str, Any], registry_path: Path) -> int:
     config_path = _path(args.file)
     specs = load_fleet_config(config_path)
@@ -806,6 +844,8 @@ def cmd_apply(args: argparse.Namespace, registry: dict[str, Any], registry_path:
         raise DeployError(f"Selected deployments not found in config: {', '.join(sorted(missing))}")
     if selected:
         specs = [spec for spec in specs if spec["name"] in selected]
+
+    check_fleet_registry_bindings(specs, registry)
 
     resolved: list[tuple[str, dict[str, Any]]] = []
     failures: list[tuple[str, str]] = []

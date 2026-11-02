@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from opencdr_deploy import cli
 from opencdr_deploy.fleet import FleetConfigError, load_fleet_config
 
 
@@ -109,3 +110,65 @@ core_version = "v1.2.1"
     )
     with pytest.raises(FleetConfigError, match="Duplicate deployment"):
         load_fleet_config(config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("stage", "prod"),
+        ("region", "eu-west-1"),
+        ("expected_account_id", "222222222222"),
+        ("expected_account_id", None),
+    ],
+)
+def test_fleet_apply_cannot_redirect_an_existing_name(field, value):
+    identity = {
+        "name": "dev",
+        "stage": "dev",
+        "region": "us-east-1",
+        "expected_account_id": "111111111111",
+    }
+    registry = {"version": 1, "deployments": {"dev": dict(identity)}}
+    changed = {**identity, field: value}
+    with pytest.raises(cli.DeployError, match="different AWS account, region or stage"):
+        cli.check_fleet_registry_bindings([changed], registry)
+    cli.check_fleet_registry_bindings([identity], registry)
+
+
+def test_fleet_apply_reuses_registered_name_instead_of_duplicate_identity():
+    existing = {"stage": "dev", "region": "us-east-1", "expected_account_id": "111111111111"}
+    registry = {"version": 1, "deployments": {"original-dev": existing}}
+    with pytest.raises(cli.DeployError, match="already registered as"):
+        cli.check_fleet_registry_bindings([{**existing, "name": "new-dev"}], registry)
+    cli.check_fleet_registry_bindings([{**existing, "name": "original-dev"}], registry)
+
+
+def test_fleet_name_conflict_stops_before_source_download_or_registry_writes(tmp_path, monkeypatch):
+    config = write_config(
+        tmp_path / "fleet.toml",
+        """
+version = 1
+[[deployments]]
+name = "dev"
+stage = "dev"
+region = "us-east-1"
+expected_account_id = "111111111111"
+core_version = "v1.2.1"
+""",
+    )
+    registry_path = tmp_path / "registry.json"
+    registry = {
+        "version": 1,
+        "deployments": {
+            "dev": {
+                "stage": "prod",
+                "region": "us-east-1",
+                "expected_account_id": "111111111111",
+            }
+        },
+    }
+    monkeypatch.setattr(cli, "build_deployment", lambda **_kwargs: pytest.fail("source changed"))
+    args = cli.build_parser().parse_args(["apply", "--file", str(config)])
+    with pytest.raises(cli.DeployError):
+        cli.cmd_apply(args, registry, registry_path)
+    assert not registry_path.exists()

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 - 2026-11-02
+
+- Add a step-by-step SOC operator guide for applying a platform-generated file.
+- Refuse fleet files that redirect an existing local installation to another
+  account, region or stage, or register the same known AWS deployment twice.
+- Report missing deployed feature outputs as unknown instead of assuming defaults;
+  include the deployed Core version when the stack reports it.
+
 ## 0.4.0 - 2026-10-28
 
 - Make `opencdr-deploy` the supported interface for management, catalog loading,
