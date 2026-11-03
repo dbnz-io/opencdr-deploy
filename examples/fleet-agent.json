@@ -1,0 +1,14 @@
+{
+  "agent_id": "member-prod",
+  "name": "Member production",
+  "account_id": "333333333333",
+  "region": "us-east-1",
+  "stage": "prod",
+  "api_url": "https://CORE_API_ID.execute-api.us-east-1.amazonaws.com/prod",
+  "enabled": true,
+  "allow_writes": false,
+  "settings_ids": [
+    "global"
+  ],
+  "integration_ids": []
+}

@@ -2,7 +2,9 @@
 
 `opencdr-deploy` installs and manages multiple named
 [OpenCDR Core](https://github.com/dbnz-io/opencdr) deployments from one
-computer. Each installation can use a different Core checkout/version, AWS
+computer. It also installs and operates optional
+[OpenCDR Fleet Managers](https://github.com/dbnz-io/opencdr-fleet-manager)
+in security accounts. Each installation can use a different Core checkout/version, AWS
 profile or account, region, stage, and feature set.
 
 The tool is an orchestrator, not a second infrastructure engine. OpenCDR Core's
@@ -17,7 +19,7 @@ of commands, expected results and troubleshooting, without requiring a Core clon
 ```bash
 python3 -m venv "$HOME/.opencdr-tools"
 . "$HOME/.opencdr-tools/bin/activate"
-python -m pip install --upgrade 'opencdr-deploy>=0.5.0'
+python -m pip install --upgrade 'opencdr-deploy>=0.6.0'
 opencdr-deploy --help
 opencdr-deploy --version
 ```
@@ -27,6 +29,187 @@ that Core release: AWS CLI, Node/npm, Serverless Framework, Docker, `jq`, and
 Python 3.12. `opencdr-deploy doctor` checks the selected installation.
 In each new terminal, run `. "$HOME/.opencdr-tools/bin/activate"` to use the
 installed tool. These shell commands apply to macOS/Linux or Windows WSL.
+
+## Deploy and operate Fleet Manager
+
+Fleet commands require OpenCDR Deploy 0.6.0 or later. The managed source defaults
+to Fleet Manager **v0.1.1**, which supports small-account Lambda quotas. Fleet
+Manager runs in the security account; it polls registered Core agents and forwards
+explicit API operations. It does not deploy Core stacks or replace Core as the
+authority for detections, configuration and response execution.
+
+You can run these commands from any directory. **No fleet-manager clone is
+required.** Git, Node/npm, Python 3.12+ and an authenticated AWS profile are needed
+for packaging/deployment. The CLI obtains the versioned service source from
+`https://github.com/dbnz-io/opencdr-fleet-manager.git`, creates isolated build tools,
+installs hash-locked Python requirements and locked Node dependencies, and invokes
+the service's pinned Serverless Framework. Serverless authentication still follows
+your organization's setup. API-only operations need the AWS profile and saved URL;
+they do not clone repositories or install Node/build tools.
+
+### 1. Build and review the package
+
+Replace the account ID with your security account. This checks the AWS identity
+before packaging but does not create the fleet stack:
+
+```bash
+aws sso login --profile security-admin
+opencdr-deploy fleet deploy security-prod \
+  --profile security-admin \
+  --security-account-id 222222222222 \
+  --region us-east-1 \
+  --stage prod \
+  --package-only \
+  --output /tmp/opencdr-fleet-reviewed
+```
+
+Expected: `Package ready ... No AWS stack was created or updated.` Review
+`/tmp/opencdr-fleet-reviewed/cloudformation-template-update-stack.json`. The
+directory includes the exact Lambda ZIP and a content/target manifest. Keep it in
+place until deployment; it must not be moved or edited after review.
+
+### 2. Deploy that exact artifact
+
+```bash
+opencdr-deploy fleet deploy security-prod --artifact /tmp/opencdr-fleet-reviewed
+opencdr-deploy fleet status --fleet security-prod
+```
+
+Deployment saves the `FleetManagerApiUrl` automatically. `--artifact` verifies the
+account, region, stage, version, feature options and artifact digest before
+deploying without rebuilding. A successful package alone produces no stack
+outputs. To build and deploy in one invocation, omit `--package-only` and `--artifact`.
+
+Use `--dry-run` to inspect the managed-source/build/deploy commands without making
+AWS calls, installing tools, or writing the registry. The standard source tag can
+be changed with `--version vX.Y.Z`; previous checkouts remain available. Advanced
+users can supply `--repository-url` and `--source-root`. Local Core installation
+names and fleet-manager names are independent.
+
+### 3. Connect an already deployed manager
+
+Skip packaging/deployment when a manager already exists:
+
+```bash
+opencdr-deploy fleet connect security-prod \
+  --url https://FLEET_API_ID.execute-api.us-east-1.amazonaws.com/prod \
+  --profile security-admin \
+  --security-account-id 222222222222 \
+  --region us-east-1 --stage prod
+opencdr-deploy fleet list
+opencdr-deploy fleet status --fleet security-prod
+```
+
+The CLI verifies the manager's product, fleet contract, account, region and stage
+before saving it. Every later API operation repeats that identity check. IAM
+requests use short-lived credentials from the saved AWS profile; no AWS access
+keys or Core API keys are written to the local registry. Regional AWS `execute-api`
+URLs are supported; custom manager domains and other AWS partitions are not yet supported.
+
+`--fleet NAME` is optional when exactly one manager is saved; it is required when
+there are several. A saved name cannot silently move to another account/region/stage.
+When a manager is unavailable, operations fail instead of falling back to a direct
+Core endpoint. Existing direct Core commands remain available for standalone use.
+
+### 4. Register a Core agent
+
+Copy the [agent example](https://github.com/dbnz-io/opencdr-deploy/blob/main/examples/fleet-agent.json) to `agent.json`. Set its actual
+AWS account, region, Core stage and API URL. Start with `allow_writes: false`.
+The reviewed file contains no credentials.
+
+```bash
+aws sso login --profile member-admin
+opencdr-deploy fleet agents register --fleet security-prod \
+  --file agent.json --core-profile member-admin
+opencdr-deploy fleet agents list --fleet security-prod
+opencdr-deploy fleet agents show member-prod --fleet security-prod
+```
+
+Providing `--core-profile` explicitly prepares scoped read/operator API keys in the
+member account and copies them directly to the security account's SSM namespace.
+Both account identities are checked. The keys are never printed or written to the
+registration file. Without `--core-profile`, registration makes no AWS key changes
+and assumes SSM credentials were prepared separately. `fleet agents bootstrap`
+performs only that credential setup. Review Core's management API monthly quota
+before enabling one-minute polling; the legacy 10,000-request quota is insufficient.
+
+To import or rotate an existing scoped key through hidden terminal input:
+
+```bash
+opencdr-deploy fleet agents credentials member-prod --kind read --fleet security-prod
+opencdr-deploy fleet agents refresh member-prod --fleet security-prod
+```
+
+### 5. Manage agents and their complete Core API
+
+```bash
+opencdr-deploy fleet agents configuration member-prod --kind list --fleet security-prod
+opencdr-deploy fleet agents request member-prod GET '/rules?rule_kind=signal' --fleet security-prod
+opencdr-deploy fleet agents request member-prod PUT /rules/example \
+  --file rule-update.json --fleet security-prod
+opencdr-deploy fleet agents request member-prod DELETE '/rules/example?rule_kind=signal' \
+  --fleet security-prod
+```
+
+Forwarded paths and JSON bodies use the Core API contract, including each target's
+`expected_rev`. Writes need both operator SSM credentials and `allow_writes: true`
+on the agent registration. Update registration with a full reviewed file:
+
+```bash
+opencdr-deploy fleet agents update member-prod --file agent.json --expected-rev 1 --fleet security-prod
+opencdr-deploy fleet agents disable member-prod --expected-rev 2 --fleet security-prod
+opencdr-deploy fleet agents enable member-prod --expected-rev 3 --fleet security-prod
+```
+
+The CLI preserves revision conflicts, partial results, manager envelopes and
+uncertain write outcomes. It returns a nonzero exit status for failed targets in
+HTTP 207 results and does not retry writes. After an uncertain write, inspect the
+agent's actual state before retrying. Disabling an agent retains registry/history
+and blocks forwarding; it does not revoke its API keys.
+
+The complete manager API, including explicit multi-agent reads/writes, is available
+through `fleet request`. Agent listing follows every cursor; configuration and raw
+API requests return pagination metadata for explicit continuation.
+
+```bash
+opencdr-deploy fleet request GET '/v1/agents?limit=20' --fleet security-prod
+opencdr-deploy fleet request POST /v1/fleet/read --file fleet-read.json --fleet security-prod
+```
+
+### Change deployment flags or recover a failed first deployment
+
+Repeat deployment with new flags to update the existing stack:
+
+```bash
+opencdr-deploy fleet deploy security-prod --security-profile hardened --poll-concurrency 2
+opencdr-deploy fleet deploy security-prod --pause-polling
+opencdr-deploy fleet deploy security-prod --enable-polling --snapshot-retention-hours 48
+```
+
+Defaults are standard security, polling enabled, 24-hour snapshots and a queue
+concurrency cap of **2**. Polling uses shared Lambda capacity and makes no reserved
+concurrency allocation. Larger fleets can raise `--poll-concurrency` after checking
+the account quota and queue backlog. The cap does not guarantee capacity when other
+workloads consume the account's shared pool. Hardened enables extra table recovery
+controls; a downgrade requires `--allow-protection-downgrade` explicitly.
+
+If an initial deployment fails, the stack can disappear while retained DynamoDB
+tables remain. The CLI detects this before attempting another deploy. Import those
+tables into a minimal stack, then let Serverless finish deployment:
+
+```bash
+opencdr-deploy fleet recover security-prod \
+  --profile security-admin --security-account-id 222222222222 --region us-east-1 --stage prod
+# Review the printed import-only plan, then explicitly apply it:
+opencdr-deploy fleet recover security-prod \
+  --profile security-admin --security-account-id 222222222222 --region us-east-1 --stage prod --execute
+opencdr-deploy fleet deploy security-prod
+```
+
+Recovery preserves the existing table names, data, TTL and PITR settings. It does
+not delete the retained tables or reset their contents. It refuses a change set
+containing any action other than `Import`. Fleet Manager IAM permission guidance
+and service limits are in its [repository](https://github.com/dbnz-io/opencdr-fleet-manager).
 
 ## Install the optional MCP client
 
@@ -265,6 +448,42 @@ hatches. Direct execution of scripts from a Core checkout is also deprecated;
 it will be removed only in a separately announced major Core release.
 
 ## Manage the complete REST API
+
+API-only operators do not need AWS credentials or a Core checkout. Create an
+owner-readable JSON connection file, for example `customer-dev.json`:
+
+```json
+{
+  "url": "https://example.execute-api.us-east-1.amazonaws.com/dev",
+  "key": "REPLACE_WITH_A_SCOPED_CORE_API_KEY",
+  "deployment": {
+    "account_id": "111111111111",
+    "home_region": "us-east-1",
+    "stage": "dev"
+  }
+}
+```
+
+```bash
+chmod 600 customer-dev.json
+opencdr-deploy api request GET /status --connection customer-dev.json
+opencdr-deploy api request POST /rules/validate \
+  --connection customer-dev.json --file candidate.json
+opencdr-deploy api request GET /rules/runtime-status --connection customer-dev.json
+```
+
+The file must use HTTPS and contain `url` and `key`. The optional `deployment`
+fields are checked against Core's `/status` before an operation; a mismatch stops
+the request. Use one file per agent to select another account, region or stage.
+Explicit connections never use environment or SSM credentials and cannot be
+combined with `--deployment`. API requests refuse redirects to protect the key.
+Keep these files out of Git. The URL/key fields also work in opencdr-mcp's config
+file; its current server does not enforce the optional deployment identity fields.
+
+For registered AWS installations, the existing commands below retrieve the
+selected installation's endpoint/key through its AWS profile. Infrastructure
+operations still use that AWS path. Platform-owned cases, assignments, triage and
+approvals are outside the Core API and are not part of CLI parity.
 
 The manager retrieves the selected installation's API URL and full-scope key
 from `/opencdr-<stage>/api-url` and `/opencdr-<stage>/api-key` in SSM at request

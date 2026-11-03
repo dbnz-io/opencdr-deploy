@@ -38,6 +38,15 @@ jobs:
       - run: python -m pip install --upgrade pip build twine
       - run: python -m build
       - run: python -m twine check dist/*
+      - name: Verify installed CLI outside the repository
+        shell: bash
+        run: |
+          python -m venv /tmp/opencdr-cli-smoke
+          /tmp/opencdr-cli-smoke/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/opencdr-cli-smoke/bin/opencdr-deploy --version
+          /tmp/opencdr-cli-smoke/bin/opencdr-deploy fleet --help
+          /tmp/opencdr-cli-smoke/bin/opencdr-deploy fleet agents --help
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: python-distributions

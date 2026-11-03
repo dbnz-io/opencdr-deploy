@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencdr-deploy"
-version = "0.5.0"
+version = "0.6.0"
 description = "Install and manage multiple OpenCDR Core deployments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,7 @@ classifiers = [
   "Topic :: Security",
   "Topic :: System :: Systems Administration",
 ]
-dependencies = []
+dependencies = ["boto3==1.43.119"]
 
 [project.optional-dependencies]
 dev = [

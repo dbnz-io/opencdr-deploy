@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import shutil
@@ -18,10 +19,13 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from . import __version__
 from .fleet import FleetConfigError, load_fleet_config
+from .fleet_api import FleetManagerError
+from .fleet_manager import configure_parser as configure_fleet_parser
+from .fleet_manager import execute as execute_fleet
 from .sources import (
     DEFAULT_CORE_REPOSITORY,
     DEFAULT_SOURCE_ROOT,
@@ -67,6 +71,15 @@ class DeployError(RuntimeError):
 
 class APIResponseError(DeployError):
     """A deployed OpenCDR API request returned an error."""
+
+
+class _NoAPIRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # An API key must never follow a redirect to another endpoint.
+        return None
+
+
+urlopen = build_opener(_NoAPIRedirects()).open
 
 
 def _path(value: str | Path) -> Path:
@@ -650,7 +663,64 @@ def _request_body(args: argparse.Namespace) -> Any | None:
         raise DeployError(f"Request body is not valid JSON: {exc}") from exc
 
 
-def api_request(args: argparse.Namespace, deployment: dict[str, Any]) -> int:
+def api_connection(path: str) -> dict[str, Any]:
+    """Explicit API-only connection; never mix it with AWS or environment secrets."""
+    try:
+        connection = json.loads(_path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployError("Cannot read API connection file; expected a JSON object") from exc
+    if not isinstance(connection, dict):
+        raise DeployError("API connection file must contain a JSON object")
+    url, key = connection.get("url"), connection.get("key")
+    if not isinstance(url, str) or not isinstance(key, str) or not key.strip():
+        raise DeployError("API connection requires url and key strings")
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            parsed.scheme == "https"
+            and parsed.hostname
+            and parsed.port != 0
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+            and not any(char.isspace() or ord(char) < 32 for char in url)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise DeployError("API connection url must be HTTPS without user info, query or fragment")
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        raise DeployError("API connection key contains invalid characters")
+    identity = connection.get("deployment", {})
+    if not isinstance(identity, dict) or set(identity) - {"account_id", "home_region", "stage"}:
+        raise DeployError("Connection deployment accepts account_id, home_region and stage only")
+    if any(not isinstance(value, str) or not value.strip() for value in identity.values()):
+        raise DeployError("Connection deployment identity fields must be non-empty strings")
+    if "account_id" in identity and not re.fullmatch(r"\d{12}", identity["account_id"]):
+        raise DeployError("Connection account_id must contain exactly 12 digits")
+    return {"url": url.rstrip("/"), "key": key, "deployment": identity}
+
+
+def verify_api_identity(connection: dict[str, Any], timeout: float) -> None:
+    """Compare expected identity with this Core agent before issuing an operation."""
+    expected = connection["deployment"]
+    if not expected:
+        return
+    request = Request(connection["url"] + "/status", headers={"x-api-key": connection["key"]})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            status = json.loads(response.read())
+    except (HTTPError, URLError, ValueError) as exc:
+        raise APIResponseError("Cannot verify Core deployment identity; no operation sent") from exc
+    identity = status.get("deployment") if isinstance(status, dict) else None
+    if not isinstance(identity, dict) or any(identity.get(k) != v for k, v in expected.items()):
+        raise APIResponseError(
+            "Core deployment identity does not match connection; no operation sent"
+        )
+
+
+def api_request(args: argparse.Namespace, deployment: dict[str, Any] | None = None) -> int:
     parsed = urlsplit(args.path)
     if (
         parsed.scheme
@@ -669,7 +739,16 @@ def api_request(args: argparse.Namespace, deployment: dict[str, Any]) -> int:
     if body is not None and args.method in {"GET", "DELETE"}:
         raise DeployError(f"{args.method} requests cannot include a JSON body")
 
-    env = api_environment(deployment)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise DeployError("API timeout must be a positive finite number")
+    if getattr(args, "connection", None):
+        connection = api_connection(args.connection)
+        verify_api_identity(connection, args.timeout)
+        env = {"OPENCDR_API_URL": connection["url"], "OPENCDR_API_KEY": connection["key"]}
+    else:
+        if deployment is None:
+            raise DeployError("API request requires --connection FILE or --deployment NAME")
+        env = api_environment(deployment)
     payload = json.dumps(body).encode() if body is not None else None
     request = Request(
         env["OPENCDR_API_URL"].rstrip("/") + path,
@@ -682,11 +761,9 @@ def api_request(args: argparse.Namespace, deployment: dict[str, Any]) -> int:
             raw = response.read().decode()
     except HTTPError as exc:
         raw = exc.read().decode(errors="replace")
-        try:
-            detail = json.loads(raw).get("message", raw)
-        except (json.JSONDecodeError, AttributeError):
-            detail = raw
-        raise APIResponseError(f"API HTTP {exc.code}: {detail}") from exc
+        # Release conflicts can follow completed writes. Preserve the agent's
+        # result instead of throwing away the per-rule completion evidence.
+        raise APIResponseError(f"API HTTP {exc.code}: {raw}") from exc
     except URLError as exc:
         raise APIResponseError(f"API request failed: {exc.reason}") from exc
 
@@ -1078,6 +1155,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deployment", help="named deployment to operate on")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    configure_fleet_parser(commands)
+
     installations = commands.add_parser("installations", help="manage named deployments")
     installation_commands = installations.add_subparsers(
         dest="installations_command", required=True
@@ -1229,6 +1308,11 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--file", help="JSON request body file, or - for stdin")
     request.add_argument("--data", help="inline JSON request body")
     request.add_argument("--timeout", type=float, default=30.0)
+    request.add_argument(
+        "--connection",
+        metavar="FILE",
+        help="API-only JSON connection; url/key and optional deployment identity; no AWS needed",
+    )
     core_cli = api_commands.add_parser(
         "core-cli", help="deprecated alias for the top-level manage command"
     )
@@ -1241,7 +1325,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(normalize_operator_argv(argv))
     registry_path = _path(args.registry)
     try:
+        if args.command == "api" and args.api_command == "request" and args.connection:
+            if args.deployment:
+                raise DeployError("Choose --connection FILE or --deployment NAME, not both")
+            if args.file and args.data:
+                raise DeployError("--file and --data are mutually exclusive")
+            return api_request(args)
         registry = load_registry(registry_path)
+        if args.command == "fleet":
+            if args.deployment:
+                raise DeployError("Fleet commands use --fleet NAME; do not mix --deployment")
+            return execute_fleet(
+                args, registry, registry_path, runner=run, save_registry=save_registry
+            )
         if args.command == "installations":
             return cmd_installations(args, registry, registry_path)
         if args.command == "apply":
@@ -1373,7 +1469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 needs_api=True,
             )
         raise DeployError(f"Unsupported command: {args.command}")
-    except APIResponseError as exc:
+    except (APIResponseError, FleetManagerError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except (DeployError, FleetConfigError, SourceError) as exc:
