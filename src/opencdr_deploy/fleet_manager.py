@@ -28,11 +28,20 @@ from .fleet_api import (
     response_ok,
     verify_account,
 )
-from .fleet_recovery import apply_recovery, existing_stack, recovery_plan, retained_tables
+from .fleet_recovery import (
+    IMPORT_DESCRIPTION,
+    apply_recovery,
+    existing_stack,
+    pinned_bucket_name,
+    recovery_plan,
+    retained_tables,
+    validate_plan,
+    verify_recovery_template,
+)
 from .sources import SourceError, install_core_source, validate_repository_url, validate_version
 
 REPOSITORY = "https://github.com/dbnz-io/opencdr-fleet-manager.git"
-DEFAULT_VERSION = "v0.1.1"
+DEFAULT_VERSION = "v0.2.0"
 SOURCE_ROOT = Path(
     os.environ.get("OPENCDR_FLEET_SOURCE_ROOT", "~/.local/share/opencdr-deploy/fleet-manager")
 ).expanduser()
@@ -51,8 +60,11 @@ REGISTRATION_FIELDS = {
     "api_url",
     "enabled",
     "allow_writes",
+    "allow_triage",
     "settings_ids",
     "integration_ids",
+    "auth_mode",
+    "write_access",
 }
 
 
@@ -60,6 +72,10 @@ def configure_parser(commands) -> None:
     fleet = commands.add_parser("fleet", help="deploy and operate an optional Fleet Manager")
     actions = fleet.add_subparsers(dest="fleet_command", required=True)
     actions.add_parser("list", help="list saved fleet managers (no AWS calls)")
+    worker_identity = actions.add_parser(
+        "worker-identity", help="read the deployed detection worker's immutable IAM identity"
+    )
+    worker_identity.add_argument("name")
     connect = actions.add_parser("connect", help="verify and save an existing Fleet Manager")
     connect.add_argument("name")
     connect.add_argument("--url", required=True)
@@ -67,14 +83,27 @@ def configure_parser(commands) -> None:
     connect.add_argument("--security-account-id", required=True)
     connect.add_argument("--region", default="us-east-1")
     connect.add_argument("--stage", default="prod")
+    connect.add_argument(
+        "--access",
+        choices=["observer", "triage", "operator", "responder", "administrator", "integration"],
+        default="observer",
+    )
     recover = actions.add_parser(
-        "recover", help="import retained tables after a failed initial deploy"
+        "recover", help="review and reattach retained Fleet tables and paired evidence storage"
     )
     recover.add_argument("name")
     recover.add_argument("--profile")
     recover.add_argument("--security-account-id")
     recover.add_argument("--region")
     recover.add_argument("--stage")
+    recover.add_argument(
+        "--evidence-bucket", help="original bucket if deleted-stack discovery is unavailable"
+    )
+    recover.add_argument("--out", type=Path, help="save the read-only recovery plan for review")
+    recover.add_argument("--plan", type=Path, help="saved plan to execute or resume")
+    recover.add_argument(
+        "--expected-plan-digest", help="exact reviewed SHA-256 from the saved plan"
+    )
     recover.add_argument(
         "--execute",
         action="store_true",
@@ -95,6 +124,10 @@ def configure_parser(commands) -> None:
         parser.add_argument("--region")
         parser.add_argument("--stage")
         parser.add_argument(
+            "--access",
+            choices=["observer", "triage", "operator", "responder", "administrator", "integration"],
+        )
+        parser.add_argument(
             "--version", dest="fleet_version", help="Fleet Manager tag, e.g. v0.1.0"
         )
         parser.add_argument("--repository-url", help="source repository; default is dbnz-io's repo")
@@ -103,6 +136,19 @@ def configure_parser(commands) -> None:
         parser.add_argument("--security-profile", choices=["standard", "hardened"])
         parser.add_argument("--snapshot-retention-hours", type=int)
         parser.add_argument("--poll-concurrency", type=_positive)
+        parser.add_argument("--poll-interval-minutes", type=_positive)
+        parser.add_argument("--full-refresh-minutes", type=_positive)
+        parser.add_argument("--detection-poll-interval-minutes", type=_positive)
+        parser.add_argument("--detection-retention-days", type=_positive)
+        parser.add_argument("--detection-poll-concurrency", type=_positive)
+        detections = parser.add_mutually_exclusive_group()
+        detections.add_argument(
+            "--pause-detection-polling", dest="detection_polling_enabled", action="store_false"
+        )
+        detections.add_argument(
+            "--enable-detection-polling", dest="detection_polling_enabled", action="store_true"
+        )
+        parser.set_defaults(detection_polling_enabled=None)
         parser.add_argument("--allowed-agent-hosts")
         poll = parser.add_mutually_exclusive_group()
         poll.add_argument("--pause-polling", dest="polling_enabled", action="store_false")
@@ -145,9 +191,11 @@ def configure_parser(commands) -> None:
     _target(register)
     register.add_argument("--file", required=True)
     register.add_argument(
-        "--core-profile", help="also prepare scoped keys using this member profile"
+        "--core-profile", help="prepare an IAM trust plan or explicit legacy credentials"
     )
-    bootstrap = agent_commands.add_parser("bootstrap", help="prepare scoped Core keys in fleet SSM")
+    bootstrap = agent_commands.add_parser(
+        "bootstrap", help="prepare an IAM trust plan or explicit legacy credentials"
+    )
     _target(bootstrap)
     bootstrap.add_argument("--file", required=True)
     bootstrap.add_argument("--core-profile", required=True)
@@ -208,6 +256,30 @@ def _validate(config: dict[str, Any]) -> None:
     retention = config.get("snapshot_retention_hours", 24)
     if not isinstance(retention, int) or isinstance(retention, bool) or not 2 <= retention <= 168:
         raise FleetManagerError("Snapshot retention must be 2–168 hours")
+    interval = config.get("poll_interval_minutes", 1)
+    refresh = config.get("full_refresh_minutes", 60)
+    if (
+        not isinstance(interval, int)
+        or isinstance(interval, bool)
+        or not 1 <= interval <= 60
+        or not isinstance(refresh, int)
+        or isinstance(refresh, bool)
+        or not interval <= refresh <= 1440
+    ):
+        raise FleetManagerError(
+            "Poll interval must be 1–60 minutes; "
+            "full refresh must be between that interval and 1440"
+        )
+    for field, default, low, high in (
+        ("detection_poll_interval_minutes", 1, 1, 60),
+        ("detection_retention_days", 90, 7, 365),
+        ("detection_poll_concurrency", 2, 2, 1000),
+    ):
+        value = config.get(field, default)
+        if type(value) is not int or not low <= value <= high:
+            raise FleetManagerError(f"{field} must be {low}–{high}")
+    if type(config.get("detection_polling_enabled", True)) is not bool:
+        raise FleetManagerError("detection_polling_enabled must be boolean")
     concurrency = config.get("poll_concurrency", 2)
     if (
         not isinstance(concurrency, int)
@@ -226,6 +298,11 @@ def _validate(config: dict[str, Any]) -> None:
         raise FleetManagerError("polling_enabled must be boolean")
     if config.get("api_url"):
         endpoint(config["api_url"], config["region"], config["stage"])
+    bucket = config.get("recovered_detection_bucket")
+    if bucket is not None and (
+        not isinstance(bucket, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket)
+    ):
+        raise FleetManagerError("Invalid recovered evidence bucket")
 
 
 def _managers(registry):
@@ -405,10 +482,19 @@ def _parameters(config):
         f"--param=securityProfile={config['security_profile']}",
         f"--param=snapshotRetentionHours={config['snapshot_retention_hours']}",
         f"--param=pollingEnabled={str(config['polling_enabled']).lower()}",
+        f"--param=pollIntervalMinutes={config.get('poll_interval_minutes', 1)}",
+        f"--param=fullRefreshMinutes={config.get('full_refresh_minutes', 60)}",
+        f"--param=detectionPollIntervalMinutes={config.get('detection_poll_interval_minutes', 1)}",
+        f"--param=detectionRetentionDays={config.get('detection_retention_days', 90)}",
+        f"--param=detectionPollConcurrency={config.get('detection_poll_concurrency', 2)}",
+        "--param=detectionPollingEnabled="
+        + str(config.get("detection_polling_enabled", True)).lower(),
     ]
     result.append("--param=pollConcurrency=" + str(config.get("poll_concurrency", 2)))
     if config["allowed_agent_hosts"]:
         result.append(f"--param=allowedAgentHosts={config['allowed_agent_hosts']}")
+    if config.get("recovered_detection_bucket"):
+        result.append("--param=detectionEvidenceBucketName=" + config["recovered_detection_bucket"])
     return result
 
 
@@ -475,6 +561,8 @@ def _package(config, repo, python, source, args, runner):
         for file in output.rglob("*"):
             file.chmod(0o700 if file.is_dir() else 0o600)
         output.chmod(0o700)
+        if config.get("recovered_detection_bucket") or config.get("recovery_storage"):
+            _check_artifact(output, config)
     return output
 
 
@@ -493,6 +581,14 @@ def _check_artifact(artifact, config):
         "snapshot_retention_hours",
         "allowed_agent_hosts",
         "poll_concurrency",
+        "poll_interval_minutes",
+        "full_refresh_minutes",
+        "detection_poll_interval_minutes",
+        "detection_retention_days",
+        "detection_poll_concurrency",
+        "detection_polling_enabled",
+        "recovered_detection_bucket",
+        "recovery_storage",
         "source_version",
         "repository_url",
     )
@@ -511,6 +607,15 @@ def _check_artifact(artifact, config):
     source_artifact = state["service"]["initialServerlessConfig"]["package"]["artifact"]
     if Path(source_artifact).resolve() != artifact / "fleet-manager.zip":
         raise FleetManagerError("Artifact moved or references an outside ZIP; build a new package")
+    if config.get("recovered_detection_bucket") or config.get("recovery_storage"):
+        template = json.loads((artifact / "cloudformation-template-update-stack.json").read_text())
+        if (
+            config.get("recovered_detection_bucket")
+            and pinned_bucket_name(template) != config["recovered_detection_bucket"]
+        ):
+            raise FleetManagerError("Runtime package would disconnect the retained evidence bucket")
+        if config.get("recovery_storage"):
+            verify_recovery_template(template, config)
     return manifest
 
 
@@ -522,9 +627,32 @@ def _deploy(args, registry, save, runner):
         "security_account_id": args.security_account_id or previous.get("security_account_id"),
         "region": args.region or previous.get("region", "us-east-1"),
         "stage": args.stage or previous.get("stage", "prod"),
+        "access": args.access or previous.get("access", "observer"),
+        **{
+            key: previous[key]
+            for key in ("recovered_detection_bucket", "recovery_storage", "last_recovery")
+            if key in previous
+        },
+        "poll_interval_minutes": args.poll_interval_minutes
+        if args.poll_interval_minutes is not None
+        else previous.get("poll_interval_minutes", 1),
+        "full_refresh_minutes": args.full_refresh_minutes
+        if args.full_refresh_minutes is not None
+        else previous.get("full_refresh_minutes", 60),
         "poll_concurrency": args.poll_concurrency
         if args.poll_concurrency is not None
         else previous.get("poll_concurrency", 2),
+        **{
+            key: getattr(args, key, None)
+            if getattr(args, key, None) is not None
+            else previous.get(key, default)
+            for key, default in (
+                ("detection_poll_interval_minutes", 1),
+                ("detection_retention_days", 90),
+                ("detection_poll_concurrency", 2),
+                ("detection_polling_enabled", True),
+            )
+        },
         "source_version": args.fleet_version or previous.get("source_version", DEFAULT_VERSION),
         "repository_url": args.repository_url or previous.get("repository_url", REPOSITORY),
         "source_root": str(args.source_root or previous.get("source_root", SOURCE_ROOT)),
@@ -577,6 +705,15 @@ def _deploy(args, registry, save, runner):
             manifest = _check_artifact(artifact, config)
             config["source_commit"] = manifest["source_commit"]
     repo, source = _source(config, runner, args.dry_run)
+    if (
+        config.get("recovered_detection_bucket")
+        and not args.dry_run
+        and "detectionEvidenceBucketName:" not in (repo / "serverless.yml").read_text()
+    ):
+        raise FleetManagerError(
+            "Selected Fleet source cannot preserve the recovered evidence bucket; "
+            "use a compatible version"
+        )
     python = _prepare(repo, config, runner, args.python, args.dry_run)
     if not args.artifact:
         artifact = _package(config, repo, python, source, args, runner)
@@ -594,6 +731,9 @@ def _deploy(args, registry, save, runner):
         return 0
     if not args.dry_run:
         _check_artifact(artifact, config)
+        from .ownership_contract import guard_legacy_deployment
+
+        guard_legacy_deployment(session, f"opencdr-fleet-manager-{config['stage']}")
         stack = aws_client(session, "cloudformation")
         try:
             description = stack.describe_stacks(
@@ -609,12 +749,30 @@ def _deploy(args, registry, save, runner):
             ]
             if isinstance(template, str):
                 template = json.loads(template)
+            if template.get("Description") == IMPORT_DESCRIPTION and not config.get(
+                "recovery_storage"
+            ):
+                raise FleetManagerError(
+                    "Resume the saved recovery plan to restore local storage guards "
+                    "before deploying runtime"
+                )
+            live_bucket = pinned_bucket_name(template, parameters)
+            if live_bucket:
+                candidate = json.loads(
+                    (artifact / "cloudformation-template-update-stack.json").read_text()
+                )
+                if pinned_bucket_name(candidate) != live_bucket:
+                    raise FleetManagerError(
+                        "Runtime package would disconnect the retained evidence bucket; "
+                        "restore the recovery registry and rebuild"
+                    )
             hardened = any(
                 resource.get("Properties", {})
                 .get("PointInTimeRecoverySpecification", {})
                 .get("PointInTimeRecoveryEnabled")
                 is True
-                for resource in template.get("Resources", {}).values()
+                for logical, resource in template.get("Resources", {}).items()
+                if logical in {"RegistryTable", "StatusTable", "ConfigurationTable"}
             )
             hardened |= parameters.get("securityProfile") == "hardened"
             condition = template.get("Conditions", {}).get("Hardened", {}).get("Fn::Equals", [])
@@ -659,6 +817,15 @@ def _deploy(args, registry, save, runner):
                 outputs["FleetManagerApiUrl"], config["region"], config["stage"]
             )
         config["deployed_security_profile"] = config["security_profile"]
+        if outputs.get("DetectionEvidenceBucket"):
+            config["observed_detection_evidence_bucket"] = outputs["DetectionEvidenceBucket"]
+        config["observed_stack_id"] = response.get("StackId")
+        # This guard covered the first runtime update after import. Preserve the
+        # bucket pin and audit summary; subsequent explicitly requested settings
+        # changes use normal reviewed deployment behavior.
+        if config.get("recovery_storage"):
+            config.pop("recovery_storage")
+            previous = {k: v for k, v in previous.items() if k != "recovery_storage"}
         _managers(registry)[args.name] = {**previous, **config}
         save(registry)
         print(
@@ -677,6 +844,46 @@ def _deploy(args, registry, save, runner):
 def _bootstrap(args, config, runner):
     if args.file == "-":
         raise FleetManagerError("Credential bootstrap requires a reviewed JSON file, not stdin")
+    agent = _registration(args.file)
+    if agent.get("auth_mode", "iam") == "iam":
+        security = aws_session(config)
+        core = aws_session({"aws_profile": args.core_profile, "region": agent["region"]})
+        verify_account(security, config["security_account_id"])
+        verify_account(core, agent["account_id"])
+        stack = aws_client(security, "cloudformation").describe_stacks(
+            StackName=f"opencdr-fleet-manager-{config['stage']}"
+        )["Stacks"][0]
+        outputs = {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+        required = [
+            "PollRoleArn",
+            "DetectionPollRoleArn",
+            "ManagementObserverRoleArn",
+            "ManagementOperatorRoleArn",
+            "ManagementResponderRoleArn",
+            "ManagementAdministratorRoleArn",
+            "RolloutOperatorRoleArn",
+            "RolloutResponderRoleArn",
+            "RolloutAdministratorRoleArn",
+        ]
+        if agent.get("allow_triage"):
+            required.extend(["ManagementTriageRoleArn", "ApiRoleArn"])
+        if any(key not in outputs for key in required):
+            raise FleetManagerError("Upgrade Fleet Manager before IAM onboarding")
+        print(
+            json.dumps(
+                {
+                    "auth_mode": "iam",
+                    "principal_arns": [outputs[key] for key in required],
+                    "next_step": (
+                        "Apply these exact Core trust principals, "
+                        "then register without --core-profile"
+                    ),
+                    "credentials_created": False,
+                },
+                indent=2,
+            )
+        )
+        return False
     repo, _ = _source(config, runner)
     python = _prepare(repo, config, runner, node=False)
     runner(
@@ -699,6 +906,7 @@ def _bootstrap(args, config, runner):
         cwd=repo,
         env=_environment(config, repo),
     )
+    return True
 
 
 def execute(args, registry, registry_path, *, runner, save_registry):
@@ -709,7 +917,48 @@ def execute(args, registry, registry_path, *, runner, save_registry):
         if args.fleet_command == "list":
             print(json.dumps(_managers(registry), indent=2))
             return 0
+        if args.fleet_command == "worker-identity":
+            config = selected(registry, args.name)
+            session = aws_session(config)
+            verify_account(session, config["security_account_id"])
+            stack = aws_client(session, "cloudformation").describe_stacks(
+                StackName="opencdr-fleet-manager-" + config["stage"]
+            )["Stacks"][0]
+            outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+            arn = outputs.get("DetectionPollRoleArn", "")
+            match = re.fullmatch(r"arn:(aws(?:-us-gov|-cn)?):iam::([0-9]{12}):role/(.+)", arn)
+            if not match or match[2] != config["security_account_id"]:
+                raise FleetManagerError("Stack has no verified detection worker role output")
+            role = aws_client(session, "iam").get_role(RoleName=match[3].rsplit("/", 1)[-1])["Role"]
+            if role.get("Arn") != arn or not re.fullmatch(
+                r"AROA[A-Z0-9]{12,64}", role.get("RoleId", "")
+            ):
+                raise FleetManagerError("Detection worker IAM identity does not match the stack")
+            print(
+                json.dumps(
+                    {
+                        "fleet": args.name,
+                        "role_arn": arn,
+                        "principal": ":".join((match[1], match[2], role["RoleId"])),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         if args.fleet_command == "recover":
+            if args.execute and (not args.plan or not args.expected_plan_digest):
+                raise FleetManagerError(
+                    "Recovery execution requires --plan and --expected-plan-digest from review"
+                )
+            if not args.execute and (args.plan or args.expected_plan_digest):
+                raise FleetManagerError(
+                    "Use --execute with the saved plan, or omit --plan to create a new plan"
+                )
+            if args.execute and (args.out or args.evidence_bucket):
+                raise FleetManagerError(
+                    "Execution uses the saved plan's evidence bucket; "
+                    "omit --out and --evidence-bucket"
+                )
             previous = _managers(registry).get(args.name, {})
             config = {
                 **previous,
@@ -724,23 +973,73 @@ def execute(args, registry, registry_path, *, runner, save_registry):
             _bind(registry, config)
             session = aws_session(config)
             verify_account(session, config["security_account_id"])
-            plan = recovery_plan(session, config["stage"])
             if not args.execute:
+                plan = recovery_plan(
+                    session,
+                    config["stage"],
+                    account_id=config["security_account_id"],
+                    region=config["region"],
+                    evidence_bucket=args.evidence_bucket
+                    or previous.get("observed_detection_evidence_bucket"),
+                )
+                if args.out:
+                    # Exclusive creation avoids overwriting the artifact an operator reviewed.
+                    with args.out.open("x", encoding="utf-8") as file:
+                        args.out.chmod(0o600)
+                        file.write(json.dumps(plan, indent=2) + "\n")
                 print(json.dumps(plan, indent=2))
-                print("Review the import plan, then rerun with --execute. No tables were changed.")
+                print(
+                    "Review the saved plan, then use --execute --plan FILE "
+                    "--expected-plan-digest DIGEST. No resources were changed."
+                )
                 return 0
-            result = apply_recovery(session, plan)
+            plan = json.loads(args.plan.read_text())
+            validate_plan(plan, args.expected_plan_digest)
+            if plan["target"] != {
+                "account_id": config["security_account_id"],
+                "region": config["region"],
+                "stage": config["stage"],
+                "stack_name": "opencdr-fleet-manager-" + config["stage"],
+            }:
+                raise FleetManagerError("Saved recovery plan belongs to a different target")
+            result = apply_recovery(session, plan, expected_digest=args.expected_plan_digest)
+            if result["status"] != "IMPORT_COMPLETE":
+                print(json.dumps(result, indent=2))
+                print(
+                    "Recovery is pending. Resume the same saved plan and digest; "
+                    "do not recreate or delete storage."
+                )
+                return 0
             if any(
-                resource["Properties"]["PointInTimeRecoverySpecification"][
-                    "PointInTimeRecoveryEnabled"
-                ]
-                for resource in plan["template"]["Resources"].values()
+                resource["Properties"]
+                .get("PointInTimeRecoverySpecification", {})
+                .get("PointInTimeRecoveryEnabled")
+                for logical, resource in plan["template"]["Resources"].items()
+                if logical in {"RegistryTable", "StatusTable", "ConfigurationTable"}
             ):
                 config["security_profile"] = "hardened"
+            config.update(
+                polling_enabled=False,
+                detection_polling_enabled=False,
+                recovery_storage=plan["template"]["Resources"],
+                last_recovery=result,
+            )
+            config.pop("api_url", None)
+            config.pop("last_artifact", None)
+            bucket = plan["physical_identities"].get("DetectionBucket", {}).get("bucket_name")
+            if bucket:
+                config.update(
+                    recovered_detection_bucket=bucket,
+                    observed_detection_evidence_bucket=bucket,
+                    detection_retention_days=plan["detection_retention_days"],
+                )
             _managers(registry)[args.name] = config
             save(registry)
             print(json.dumps(result, indent=2))
-            print("Tables reattached. Now run: opencdr-deploy fleet deploy " + args.name)
+            print(
+                "Storage reattached; polling stays paused. Build a compatible reviewed runtime "
+                "package with: opencdr-deploy fleet package " + args.name
+            )
             return 0
         if args.fleet_command in {"deploy", "package"}:
             return _deploy(args, registry, save, runner)
@@ -753,6 +1052,7 @@ def execute(args, registry, registry_path, *, runner, save_registry):
                 "region": args.region,
                 "stage": args.stage,
                 "api_url": args.url,
+                "access": args.access,
             }
             _validate(config)
             _bind(registry, config)
@@ -783,7 +1083,11 @@ def execute(args, registry, registry_path, *, runner, save_registry):
         if action in {"register", "bootstrap"}:
             body = _registration(args.file)
             if args.core_profile:
-                _bootstrap(args, config, runner)
+                ready = _bootstrap(args, config, runner)
+                if ready is False and action != "bootstrap":
+                    raise FleetManagerError(
+                        "IAM trust plan prepared; apply it before registering the agent"
+                    )
             if action == "bootstrap":
                 return 0
             return _print(*api.request("POST", "/v1/agents", body))

@@ -13,7 +13,6 @@ from botocore.credentials import Credentials
 from opencdr_deploy import cli
 from opencdr_deploy import fleet_api as transport
 from opencdr_deploy import fleet_manager as fleet
-from opencdr_deploy import fleet_recovery as recovery
 from opencdr_deploy.fleet_api import FleetAPI, FleetManagerError, response_ok
 
 CONFIG = {
@@ -24,6 +23,25 @@ CONFIG = {
     "aws_profile": "security-admin",
     "api_url": "https://abcdefghij.execute-api.us-east-1.amazonaws.com/prod",
 }
+
+
+def test_poll_intervals_are_validated_and_forwarded_to_source_package():
+    config = {
+        **CONFIG,
+        "poll_interval_minutes": 5,
+        "full_refresh_minutes": 120,
+        "security_profile": "standard",
+        "snapshot_retention_hours": 24,
+        "polling_enabled": True,
+        "allowed_agent_hosts": "",
+    }
+    fleet._validate(config)
+    assert "--param=pollIntervalMinutes=5" in fleet._parameters(config)
+    assert "--param=fullRefreshMinutes=120" in fleet._parameters(config)
+    with pytest.raises(FleetManagerError, match="Poll interval"):
+        fleet._validate({**config, "full_refresh_minutes": 1})
+
+
 STATUS = {
     "product": "OpenCDR Fleet Manager",
     "version": "0.1.1",
@@ -95,6 +113,29 @@ def test_local_inventory_and_help_need_no_profile_source_or_aws(invoke, monkeypa
     assert "register" in capsys.readouterr().out
 
 
+def test_reviewed_detection_reconciliation_preserves_body_and_acceptance(invoke, api, tmp_path):
+    body = {
+        "expected_generation": 12,
+        "expected_registration_rev": 3,
+        "backfill_job_id": "repair",
+        "plan_digest": "a" * 64,
+        "reason": "reviewed",
+        "accept_unrecoverable": True,
+        "request_id": "b" * 32,
+    }
+    path = tmp_path / "reconcile.json"
+    path.write_text(json.dumps(body))
+    api.request.return_value = (202, {"state": "accepted", "request_id": body["request_id"]})
+    assert (
+        invoke(
+            "request", "POST", "/v1/agents/member-prod/detections/reconcile", "--file", str(path)
+        )
+        == 0
+    )
+    api.verify.assert_called_once()
+    api.request.assert_called_once_with("POST", "/v1/agents/member-prod/detections/reconcile", body)
+
+
 def test_connect_verifies_before_saving_and_preserves_core_registry(invoke, api, registry):
     assert (
         invoke(
@@ -114,6 +155,25 @@ def test_connect_verifies_before_saving_and_preserves_core_registry(invoke, api,
     assert data["deployments"] == {"core-existing": {"preserved": True}}
     assert data["fleet_managers"]["another"]["aws_profile"] == "reader"
     assert registry.stat().st_mode & 0o777 == 0o600
+
+
+def test_reviewed_handoff_body_is_forwarded_exactly(invoke, api, tmp_path):
+    body = {
+        "expected_generation": 8,
+        "expected_registration_rev": 2,
+        "handoff_id": "replace",
+        "plan_digest": "a" * 64,
+        "target_owner": "aws:111111111111:AROAQRSTUVWXYZABCDEF",
+        "reason": "reviewed durable storage",
+        "request_id": "b" * 32,
+    }
+    path = tmp_path / "handoff.json"
+    path.write_text(json.dumps(body))
+    api.request.return_value = (202, {"state": "accepted"})
+    assert (
+        invoke("request", "POST", "/v1/agents/member/detections/handoff", "--file", str(path)) == 0
+    )
+    api.request.assert_called_once_with("POST", "/v1/agents/member/detections/handoff", body)
 
 
 def test_connect_failure_never_overwrites_saved_target(invoke, api, registry):
@@ -442,6 +502,7 @@ def build_tools(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, "existing_stack", lambda *a: {"StackStatus": "CREATE_COMPLETE"})
     monkeypatch.setattr(fleet, "retained_tables", lambda *a: {})
     cloudformation = Mock()
+    session.client.return_value = cloudformation
     cloudformation.get_template.return_value = {"TemplateBody": {"Resources": {}}}
     cloudformation.describe_stacks.return_value = {
         "Stacks": [
@@ -551,7 +612,9 @@ def test_recovery_defaults_to_plan_only(invoke, monkeypatch):
     monkeypatch.setattr(fleet, "aws_session", Mock())
     monkeypatch.setattr(fleet, "verify_account", Mock())
     monkeypatch.setattr(
-        fleet, "recovery_plan", lambda *a: {"deletes_data": False, "template": {"Resources": {}}}
+        fleet,
+        "recovery_plan",
+        lambda *a, **k: {"deletes_data": False, "template": {"Resources": {}}},
     )
     execute = Mock()
     monkeypatch.setattr(fleet, "apply_recovery", execute)
@@ -559,55 +622,233 @@ def test_recovery_defaults_to_plan_only(invoke, monkeypatch):
     execute.assert_not_called()
 
 
-def test_recovery_reads_table_configuration_and_imports_without_deletions(monkeypatch):
-    monkeypatch.setattr(recovery, "existing_stack", lambda *a: None)
-    table = {
-        "TableName": "opencdr-fleet-manager-prod-agents",
-        "TableStatus": "ACTIVE",
-        "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
-        "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
-        "BillingModeSummary": {"BillingMode": "PAY_PER_REQUEST"},
+@pytest.mark.parametrize("invalid", [None, "foreign_account", "role_changed"])
+def test_worker_identity_uses_verified_stack_role_without_mutation(
+    invoke, registry, monkeypatch, capsys, invalid
+):
+    before = registry.read_bytes()
+    arn = "arn:aws:iam::111111111111:role/path/detection-worker"
+    cf, iam = Mock(), Mock()
+    cf.describe_stacks.return_value = {
+        "Stacks": [
+            {
+                "Outputs": [
+                    {
+                        "OutputKey": "DetectionPollRoleArn",
+                        "OutputValue": arn
+                        if invalid != "foreign_account"
+                        else arn.replace("111111111111", "999999999999"),
+                    }
+                ]
+            }
+        ]
     }
-    monkeypatch.setattr(recovery, "retained_tables", lambda *a: {"RegistryTable": table})
-    dynamodb = Mock()
-    dynamodb.describe_continuous_backups.return_value = {
-        "ContinuousBackupsDescription": {
-            "PointInTimeRecoveryDescription": {"PointInTimeRecoveryStatus": "ENABLED"}
+    iam.get_role.return_value = {
+        "Role": {
+            "Arn": arn if invalid != "role_changed" else arn + "-different",
+            "RoleId": "AROAABCDEFGHIJKLMNOP",
         }
     }
-    dynamodb.describe_time_to_live.return_value = {
-        "TimeToLiveDescription": {"TimeToLiveStatus": "DISABLED"}
-    }
-    monkeypatch.setattr(recovery, "aws_client", lambda *a: dynamodb)
-    plan = recovery.recovery_plan(Mock(), "prod")
-    resource = plan["template"]["Resources"]["RegistryTable"]
-    assert resource["DeletionPolicy"] == resource["UpdateReplacePolicy"] == "Retain"
-    assert (
-        resource["Properties"]["PointInTimeRecoverySpecification"]["PointInTimeRecoveryEnabled"]
-        is True
+    monkeypatch.setattr(fleet, "aws_session", Mock())
+    monkeypatch.setattr(fleet, "verify_account", Mock())
+    monkeypatch.setattr(
+        fleet, "aws_client", lambda s, name: {"cloudformation": cf, "iam": iam}[name]
     )
-    cloudformation = Mock()
-    cloudformation.create_change_set.return_value = {"StackId": "stack-id", "Id": "change-id"}
-    cloudformation.describe_change_set.return_value = {
-        "Changes": [{"ResourceChange": {"Action": "Import"}}]
-    }
-    monkeypatch.setattr(recovery, "aws_client", lambda *a: cloudformation)
-    assert recovery.apply_recovery(Mock(), plan)["status"] == "IMPORT_COMPLETE"
-    kwargs = cloudformation.create_change_set.call_args.kwargs
-    assert kwargs["ChangeSetType"] == "IMPORT"
-    cloudformation.delete_stack.assert_not_called()
-    cloudformation.delete_table.assert_not_called()
-
-
-def test_recovery_rejects_any_change_set_with_non_import_actions(monkeypatch):
-    cloudformation = Mock()
-    cloudformation.create_change_set.return_value = {"StackId": "stack-id", "Id": "change-id"}
-    cloudformation.describe_change_set.return_value = {
-        "Changes": [{"ResourceChange": {"Action": "Remove"}}]
-    }
-    monkeypatch.setattr(recovery, "aws_client", lambda *a: cloudformation)
-    with pytest.raises(FleetManagerError, match="non-import"):
-        recovery.apply_recovery(
-            Mock(), {"stack_name": "fleet", "template": {}, "resources_to_import": []}
+    assert invoke("worker-identity", CONFIG["name"]) == (1 if invalid else 0)
+    if not invalid:
+        assert (
+            json.loads(capsys.readouterr().out)["principal"]
+            == "aws:111111111111:AROAABCDEFGHIJKLMNOP"
         )
-    cloudformation.execute_change_set.assert_not_called()
+        iam.get_role.assert_called_once_with(RoleName="detection-worker")
+    assert registry.read_bytes() == before
+
+
+def test_recovery_plan_file_cannot_overwrite_reviewed_input(invoke, monkeypatch, tmp_path):
+    monkeypatch.setattr(fleet, "aws_session", Mock())
+    monkeypatch.setattr(fleet, "verify_account", Mock())
+    value = {"plan_digest": "a" * 64}
+    monkeypatch.setattr(fleet, "recovery_plan", lambda *a, **k: value)
+    path = tmp_path / "reviewed.json"
+    assert invoke("recover", CONFIG["name"], "--out", str(path)) == 0
+    assert json.loads(path.read_text()) == value
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert invoke("recover", CONFIG["name"], "--out", str(path)) == 1
+    assert json.loads(path.read_text()) == value
+
+
+@pytest.mark.parametrize("import_only", [False, True])
+def test_registry_loss_cannot_bypass_cloud_recovery_binding(
+    invoke, tmp_path, build_tools, import_only
+):
+    _, calls, cf = build_tools
+    template = {
+        "Resources": {"DetectionBucket": {"Properties": {"BucketName": "retained-evidence"}}}
+    }
+    if import_only:
+        template["Description"] = fleet.IMPORT_DESCRIPTION
+    cf.get_template.return_value = {"TemplateBody": template}
+    assert invoke("deploy", CONFIG["name"], "--output", str(tmp_path / "artifact")) == 1
+    assert not any(call[0][1] == "deploy" for call in calls)
+
+
+def test_package_only_checks_recovered_storage_before_ready(
+    invoke, registry, tmp_path, build_tools
+):
+    repo, calls, _ = build_tools
+    (repo / "serverless.yml").write_text("detectionEvidenceBucketName: ''")
+    value = cli.load_registry(registry)
+    value["fleet_managers"][CONFIG["name"]]["recovered_detection_bucket"] = "retained-evidence"
+    cli.save_registry(registry, value)
+    assert invoke("package", CONFIG["name"], "--output", str(tmp_path / "artifact")) == 1
+    assert not any(call[0][1] == "deploy" for call in calls)
+
+
+def test_detection_polling_options_validate_and_forward_independently():
+    config = {
+        **CONFIG,
+        "security_profile": "standard",
+        "snapshot_retention_hours": 24,
+        "polling_enabled": False,
+        "allowed_agent_hosts": "",
+        "detection_poll_interval_minutes": 2,
+        "detection_retention_days": 180,
+        "detection_polling_enabled": True,
+    }
+    fleet._validate(config)
+    values = fleet._parameters(config)
+    assert "--param=pollingEnabled=false" in values
+    assert "--param=detectionPollingEnabled=true" in values
+    assert "--param=detectionPollIntervalMinutes=2" in values
+    assert "--param=detectionRetentionDays=180" in values
+    for key, value in (
+        ("detection_poll_interval_minutes", 0),
+        ("detection_retention_days", 366),
+        ("detection_poll_concurrency", 1),
+        ("detection_polling_enabled", "false"),
+    ):
+        with pytest.raises(FleetManagerError):
+            fleet._validate({**config, key: value})
+
+
+def test_reviewed_feed_recovery_preserves_exact_body_and_async_receipt(invoke, api, tmp_path):
+    body = {
+        "expected_generation": 8,
+        "expected_registration_rev": 2,
+        "backfill_job_id": "history",
+        "plan_digest": "a" * 64,
+        "target_epoch": "b" * 32,
+        "target_owner": "aws:111111111111:AROAABCDEFGHIJKLMNOP",
+        "reason": "reviewed",
+        "request_id": "c" * 32,
+        "accept_unrecoverable": True,
+    }
+    path = tmp_path / "recovery.json"
+    path.write_text(json.dumps(body))
+    api.request.return_value = (202, {"state": "accepted", "refresh_queued": False})
+    assert (
+        invoke("request", "POST", "/v1/agents/member/detections/recover", "--file", str(path)) == 0
+    )
+    api.request.assert_called_once_with("POST", "/v1/agents/member/detections/recover", body)
+
+
+def test_triage_onboarding_requires_and_reviews_exact_new_core_trust_principals(
+    monkeypatch, capsys
+):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from opencdr_deploy import fleet_manager as fleet
+    from opencdr_deploy.fleet_api import FleetManagerError
+
+    role_names = [
+        "PollRoleArn",
+        "DetectionPollRoleArn",
+        "ManagementObserverRoleArn",
+        "ManagementOperatorRoleArn",
+        "ManagementResponderRoleArn",
+        "ManagementAdministratorRoleArn",
+        "RolloutOperatorRoleArn",
+        "RolloutResponderRoleArn",
+        "RolloutAdministratorRoleArn",
+    ]
+    outputs = {name: "arn:aws:iam::123456789012:role/" + name for name in role_names}
+    cloud = Mock()
+
+    def response():
+        return {
+            "Stacks": [
+                {"Outputs": [{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()]}
+            ]
+        }
+
+    cloud.describe_stacks.side_effect = lambda **_: response()
+    monkeypatch.setattr(fleet, "aws_session", Mock())
+    monkeypatch.setattr(fleet, "aws_client", lambda *args: cloud)
+    monkeypatch.setattr(fleet, "verify_account", Mock())
+    monkeypatch.setattr(
+        fleet,
+        "_registration",
+        lambda _: {
+            "auth_mode": "iam",
+            "allow_triage": True,
+            "account_id": "111111111111",
+            "region": "us-east-1",
+        },
+    )
+    args = SimpleNamespace(file="reviewed.json", core_profile="core")
+    config = {"security_account_id": "123456789012", "stage": "test"}
+    with pytest.raises(FleetManagerError, match="Upgrade Fleet"):
+        fleet._bootstrap(args, config, Mock())
+    for name in ["ManagementTriageRoleArn", "ApiRoleArn"]:
+        outputs[name] = "arn:aws:iam::123456789012:role/" + name
+    assert fleet._bootstrap(args, config, Mock()) is False
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["credentials_created"] is False
+    assert outputs["ManagementTriageRoleArn"] in plan["principal_arns"]
+    assert outputs["ApiRoleArn"] in plan["principal_arns"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/cases",
+        "/v1/case-access",
+        "/v1/library/items",
+        "/v1/library/releases",
+        "/v1/library/items/" + "a" * 32 + "/versions",
+    ],
+)
+def test_deploy_signed_fleet_case_operations_stay_at_fleet_authority(monkeypatch, path):
+    session = Mock()
+    session.get_credentials.return_value = Credentials("id", "secret", "token")
+    send = Mock(return_value=Response({"ok": True}))
+    monkeypatch.setattr(transport, "open_request", send)
+    body = {"expected_rev": 1, "request_id": "a" * 32, "reason": "reviewed"}
+    FleetAPI(CONFIG, session).request("PUT" if path.endswith("access") else "POST", path, body)
+    request = send.call_args.args[0]
+    assert request.full_url == CONFIG["api_url"] + path
+    assert json.loads(request.data) == body
+    assert request.get_header("X-api-key") is None
+    send.assert_called_once()
+
+
+def test_dedicated_fleet_connector_connection_is_signed_and_stays_central(monkeypatch):
+    session = Mock()
+    session.get_credentials.return_value = Credentials("id", "secret", "token")
+    send = Mock(return_value=Response({"rev": 2}))
+    monkeypatch.setattr(transport, "open_request", send)
+    path = "/v1/cases/" + "b" * 32 + "/external-status"
+    FleetAPI({**CONFIG, "access": "integration"}, session).request("POST", path, {"sequence": 1})
+    request = send.call_args.args[0]
+    assert request.full_url == CONFIG["api_url"] + "/management/integration" + path
+    assert request.get_header("X-api-key") is None
+    send.assert_called_once()
+
+
+def test_legacy_deploy_cannot_remove_operational_ownership_storage(invoke, tmp_path, build_tools):
+    _, calls, cf = build_tools
+    cf.get_template.return_value = {"TemplateBody": {"Resources": {"CaseTable": {}}}}
+    assert invoke("deploy", CONFIG["name"], "--output", str(tmp_path / "artifact")) == 1
+    assert not any("deploy" in command for command, _ in calls)

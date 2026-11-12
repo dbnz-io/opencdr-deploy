@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "opencdr-deploy"
-version = "0.6.0"
+version = "0.7.0"
 description = "Install and manage multiple OpenCDR Core deployments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,12 +25,13 @@ classifiers = [
   "Topic :: Security",
   "Topic :: System :: Systems Administration",
 ]
-dependencies = ["boto3==1.43.119"]
+dependencies = ["boto3==1.43.119", "PyYAML==6.0.3", "requests==2.34.2"]
 
 [project.optional-dependencies]
 dev = [
   "build>=1.2,<2",
   "pytest>=8,<10",
+  "moto[dynamodb]>=5,<6",
   "ruff>=0.12,<1",
   "twine>=6,<7",
 ]
@@ -49,6 +50,7 @@ packages = ["src/opencdr_deploy"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100

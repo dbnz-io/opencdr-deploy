@@ -21,7 +21,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from . import __version__
+from botocore.exceptions import BotoCoreError, ClientError
+
+from . import __version__, artifacts
+from .core_api import CoreAPI
 from .fleet import FleetConfigError, load_fleet_config
 from .fleet_api import FleetManagerError
 from .fleet_manager import configure_parser as configure_fleet_parser
@@ -206,9 +209,17 @@ def run(
     )
 
 
+def effective_parameters(deployment: dict[str, Any]) -> dict[str, str]:
+    parameters = dict(deployment.get("parameters", {}))
+    parameters.setdefault(
+        "legacyApiEnabled", "false" if deployment.get("auth_mode") == "iam" else "true"
+    )
+    return parameters
+
+
 def parameter_args(deployment: dict[str, Any]) -> list[str]:
     return [
-        f"--param={key}={value}" for key, value in sorted(deployment.get("parameters", {}).items())
+        f"--param={key}={value}" for key, value in sorted(effective_parameters(deployment).items())
     ]
 
 
@@ -290,7 +301,7 @@ def package_deployment(
         "repository": str(repo),
         "stage": deployment["stage"],
         "region": deployment["region"],
-        "parameters": deployment.get("parameters", {}),
+        "parameters": effective_parameters(deployment),
         "git_revision": git_revision(repo),
         "source_dirty": bool(source_status),
         "source_status_sha256": (
@@ -316,7 +327,7 @@ def read_manifest(path: Path, name: str, deployment: dict[str, Any]) -> dict[str
         "deployment": name,
         "stage": deployment["stage"],
         "region": deployment["region"],
-        "parameters": deployment.get("parameters", {}),
+        "parameters": effective_parameters(deployment),
     }
     for key, value in expected.items():
         if manifest.get(key) != value:
@@ -360,6 +371,22 @@ def deploy_artifact(
     artifact = _path(artifact)
     if not dry_run:
         manifest = read_manifest(artifact, name, deployment)
+        template = json.loads((artifact / "cloudformation-template-update-stack.json").read_text())
+        if "DetectionFeedTable" in template.get("Resources", {}):
+            raise DeployError(
+                "Core detection storage requires guarded deployment: use release export, "
+                "release plan and release execute, then a reviewed detection-activation plan"
+            )
+        import boto3
+
+        from .ownership_contract import guard_legacy_deployment
+
+        guard_legacy_deployment(
+            boto3.Session(
+                profile_name=deployment.get("aws_profile"), region_name=deployment["region"]
+            ),
+            stack_name(deployment),
+        )
         print(
             f"Deploying immutable artifact for {manifest['git_revision'][:12]} "
             f"({manifest['artifact_sha256'][:12]})"
@@ -470,6 +497,8 @@ def build_deployment(
         repo = _path(local_repository or Path.cwd())
     item: dict[str, Any] = {
         "repository": str(repo),
+        "auth_mode": "iam",
+        "access": "operator",
         "stage": stage,
         "region": region,
         "parameters": parameters,
@@ -521,6 +550,10 @@ def deployment_status(name: str, deployment: dict[str, Any]) -> dict[str, Any]:
 
 def script_command(repo: Path, script: Path) -> list[str]:
     if script.suffix == ".py":
+        if script.name == "opencdr.py":
+            # Management uses the installed CLI's IAM transport and dependencies,
+            # independently of the Core build environment.
+            return [sys.executable, str(script)]
         candidate = repo / ".venv" / "bin" / "python"
         return [str(candidate if candidate.exists() else Path(sys.executable)), str(script)]
     if script.suffix == ".sh":
@@ -612,10 +645,13 @@ def run_operational_workflow(
 
 def api_environment(deployment: dict[str, Any]) -> dict[str, str]:
     env = deployment_env(deployment)
+    iam = deployment.get("auth_mode", "legacy-api-key") == "iam"
     for suffix, variable, decrypt in (
         ("api-url", "OPENCDR_API_URL", False),
         ("api-key", "OPENCDR_API_KEY", True),
     ):
+        if iam and suffix == "api-key":
+            continue
         command = [
             "aws",
             "ssm",
@@ -633,6 +669,13 @@ def api_environment(deployment: dict[str, Any]) -> dict[str, str]:
             command.append("--with-decryption")
         result = run(command, cwd=repository(deployment), env=env, capture=True)
         env[variable] = result.stdout.strip()
+    if iam:
+        env.pop("OPENCDR_API_KEY", None)
+        env["OPENCDR_AUTH_MODE"] = "iam"
+        env["OPENCDR_MANAGEMENT_ACCESS"] = deployment.get("access", "operator")
+        env["OPENCDR_EXPECTED_ACCOUNT_ID"] = deployment.get("expected_account_id", "")
+        env["OPENCDR_STAGE"] = deployment["stage"]
+        env["OPENCDR_REGION"] = deployment["region"]
     return env
 
 
@@ -671,6 +714,9 @@ def api_connection(path: str) -> dict[str, Any]:
         raise DeployError("Cannot read API connection file; expected a JSON object") from exc
     if not isinstance(connection, dict):
         raise DeployError("API connection file must contain a JSON object")
+    if connection.get("auth_mode") == "iam":
+        CoreAPI(connection)  # validate before requests
+        return connection
     url, key = connection.get("url"), connection.get("key")
     if not isinstance(url, str) or not isinstance(key, str) or not key.strip():
         raise DeployError("API connection requires url and key strings")
@@ -743,12 +789,35 @@ def api_request(args: argparse.Namespace, deployment: dict[str, Any] | None = No
         raise DeployError("API timeout must be a positive finite number")
     if getattr(args, "connection", None):
         connection = api_connection(args.connection)
+        if connection.get("auth_mode") == "iam":
+            client = CoreAPI(connection)
+            client.verify()
+            code, result = client.request(args.method, path, body)
+            print(json.dumps(result, indent=2, default=str))
+            return 0 if 200 <= code < 300 else 1
         verify_api_identity(connection, args.timeout)
         env = {"OPENCDR_API_URL": connection["url"], "OPENCDR_API_KEY": connection["key"]}
     else:
         if deployment is None:
             raise DeployError("API request requires --connection FILE or --deployment NAME")
         env = api_environment(deployment)
+        if env.get("OPENCDR_AUTH_MODE") == "iam":
+            client = CoreAPI(
+                {
+                    "url": env["OPENCDR_API_URL"],
+                    "aws_profile": deployment.get("aws_profile"),
+                    "access": deployment.get("access", "operator"),
+                    "deployment": {
+                        "account_id": deployment.get("expected_account_id"),
+                        "home_region": deployment["region"],
+                        "stage": deployment["stage"],
+                    },
+                }
+            )
+            client.verify()
+            code, result = client.request(args.method, path, body)
+            print(json.dumps(result, indent=2, default=str))
+            return 0 if 200 <= code < 300 else 1
     payload = json.dumps(body).encode() if body is not None else None
     request = Request(
         env["OPENCDR_API_URL"].rstrip("/") + path,
@@ -821,6 +890,10 @@ def cmd_installations(args: argparse.Namespace, registry: dict[str, Any], path: 
             source_root=_path(args.source_root),
             dry_run=args.dry_run,
         )
+        item["auth_mode"] = args.auth_mode
+        item["access"] = args.access
+        if args.auth_mode == "iam" and not item.get("expected_account_id"):
+            raise DeployError("IAM management requires --expected-account-id")
         if not args.dry_run:
             registry["deployments"][name] = item
             save_registry(path, registry)
@@ -1156,6 +1229,27 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     configure_fleet_parser(commands)
+    from . import workflows
+
+    workflows.configure(commands)
+    from . import routing_runner
+
+    routing_runner.configure(commands)
+    from . import subscription
+
+    subscription.configure(commands)
+    from . import organizations
+
+    organizations.configure(commands)
+    from . import usage_telemetry
+
+    usage_telemetry.configure(commands)
+    from . import migration_archive
+
+    migration_archive.configure(commands)
+    from . import ownership_migration
+
+    ownership_migration.configure(commands)
 
     installations = commands.add_parser("installations", help="manage named deployments")
     installation_commands = installations.add_subparsers(
@@ -1175,6 +1269,20 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--region", default="us-east-1")
     add.add_argument("--aws-profile")
     add.add_argument("--expected-account-id")
+    add.add_argument("--auth-mode", choices=["iam", "legacy-api-key"], default="iam")
+    add.add_argument(
+        "--access",
+        choices=[
+            "observer",
+            "delivery",
+            "triage",
+            "operator",
+            "responder",
+            "administrator",
+            "integration",
+        ],
+        default="operator",
+    )
     add.add_argument("--archive", choices=("true", "false"))
     add.add_argument("--xray", choices=("true", "false"))
     add.add_argument("--security-profile", choices=("standard", "hardened"))
@@ -1217,6 +1325,8 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_install.add_argument("--upgrade", action="store_true", help="upgrade an existing install")
     mcp_install.add_argument("--dry-run", action="store_true")
     mcp_commands.add_parser("status", help="show the installed MCP package and executable")
+
+    artifacts.configure_parser(commands)
 
     commands.add_parser("doctor", help="validate local tools and AWS identity")
     prepare = commands.add_parser("prepare", help="install locked local dependencies")
@@ -1311,7 +1421,7 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument(
         "--connection",
         metavar="FILE",
-        help="API-only JSON connection; url/key and optional deployment identity; no AWS needed",
+        help="Core JSON connection: IAM profile and identity, or an explicit legacy URL/key",
     )
     core_cli = api_commands.add_parser(
         "core-cli", help="deprecated alias for the top-level manage command"
@@ -1325,6 +1435,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(normalize_operator_argv(argv))
     registry_path = _path(args.registry)
     try:
+        if args.command == "ownership":
+            from . import ownership_migration
+
+            return ownership_migration.run(args)
+        if args.command == "migration-archive":
+            from . import migration_archive
+
+            return migration_archive.run(args)
+        if args.command == "usage-telemetry":
+            from . import usage_telemetry
+
+            return usage_telemetry.run(args)
+        if args.command == "organizations":
+            from . import organizations
+
+            return organizations.run(args)
+        if args.command == "subscription":
+            from . import subscription
+
+            return subscription.run(args)
+        if args.command == "routing-runner":
+            from . import routing_runner
+
+            return routing_runner.run(args)
+        if args.command == "workflow":
+            from . import workflows
+
+            return workflows.run(args)
         if args.command == "api" and args.api_command == "request" and args.connection:
             if args.deployment:
                 raise DeployError("Choose --connection FILE or --deployment NAME, not both")
@@ -1342,6 +1480,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_installations(args, registry, registry_path)
         if args.command == "apply":
             return cmd_apply(args, registry, registry_path)
+        if args.command == "release":
+            return artifacts.run(args)
         if args.command == "mcp":
             return cmd_mcp(args)
         if not args.deployment:
@@ -1403,7 +1543,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 needs_api=True,
             )
         if args.command == "catalog":
-            return run_operational_workflow(deployment, "load_rules.sh", args.arguments)
+            return run_operational_workflow(
+                deployment, "opencdr.py", args.arguments, prefix=("rules", "load"), needs_api=True
+            )
         if args.command == "test":
             if args.test_command == "local":
                 return run_operational_workflow(
@@ -1415,6 +1557,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             return run_operational_workflow(deployment, "test_deployed.sh", args.arguments)
         if args.command == "coverage":
+            if args.coverage_command == "accounts":
+                print(
+                    "LEGACY: central event forwarding. "
+                    "For account-local agents use apply and fleet registration.",
+                    file=sys.stderr,
+                )
             script = (
                 "setup_region_forwarding.sh"
                 if args.coverage_command == "regions"
@@ -1471,6 +1619,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise DeployError(f"Unsupported command: {args.command}")
     except (APIResponseError, FleetManagerError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ClientError as exc:
+        # Codes and operation names identify AWS validation/authorization failures
+        # without dumping request bodies, credentials or service error details.
+        operation = re.sub(r"[^A-Za-z0-9_-]", "", exc.operation_name)[:80]
+        code = re.sub(
+            r"[^A-Za-z0-9_-]", "", str(exc.response.get("Error", {}).get("Code", "unknown"))
+        )[:80]
+        print(
+            f"ERROR: AWS {operation} failed ({code}). "
+            "Inspect AWS state before repeating a mutation.",
+            file=sys.stderr,
+        )
+        return 1
+    except BotoCoreError:
+        print(
+            "ERROR: AWS request failed; check sign-in, network and permissions. "
+            "Inspect AWS state before repeating a mutation.",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: Invalid local input: {exc}", file=sys.stderr)
         return 1
     except (DeployError, FleetConfigError, SourceError) as exc:
         parser.error(str(exc))

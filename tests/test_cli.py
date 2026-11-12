@@ -132,6 +132,7 @@ def test_future_non_secret_feature_flags_are_supported():
 def test_parameter_arguments_are_stable():
     assert deploy.parameter_args(deployment()) == [
         "--param=archiveEnabled=false",
+        "--param=legacyApiEnabled=true",
         "--param=securityProfile=hardened",
         "--param=xrayEnabled=true",
     ]
@@ -243,7 +244,7 @@ def test_artifact_manifest_detects_changes(tmp_path):
         "deployment": "customer-a",
         "stage": "prod",
         "region": "eu-west-1",
-        "parameters": deployment()["parameters"],
+        "parameters": deploy.effective_parameters(deployment()),
         "artifact_sha256": deploy.hash_directory(artifact),
     }
     (artifact / "manifest.json").write_text(json.dumps(manifest))
@@ -310,7 +311,7 @@ def test_deploy_validates_manifest_before_transition(tmp_path, monkeypatch):
                 "deployment": "another-deployment",
                 "stage": "prod",
                 "region": "eu-west-1",
-                "parameters": deployment()["parameters"],
+                "parameters": deploy.effective_parameters(deployment()),
                 "artifact_sha256": deploy.hash_directory(artifact),
             }
         )
@@ -484,8 +485,9 @@ def test_catalog_load_injects_selected_stage_and_region(tmp_path, monkeypatch):
         )
         == 0
     )
-    command, kwargs = calls[0]
-    assert command[-5:] == ["--stage", "prod", "--region", "eu-west-1", "--dry-run"]
+    command, kwargs = calls[-1]
+    assert command[-3:] == ["rules", "load", "--dry-run"]
+    assert calls[0][0][-1] == "eu-west-1"
     assert kwargs["conceal_arguments"] is True
 
 

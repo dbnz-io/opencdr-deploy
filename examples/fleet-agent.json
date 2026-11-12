@@ -10,5 +10,7 @@
   "settings_ids": [
     "global"
   ],
-  "integration_ids": []
+  "integration_ids": [],
+  "auth_mode": "iam",
+  "write_access": "operator"
 }

@@ -19,12 +19,13 @@ of commands, expected results and troubleshooting, without requiring a Core clon
 ```bash
 python3 -m venv "$HOME/.opencdr-tools"
 . "$HOME/.opencdr-tools/bin/activate"
-python -m pip install --upgrade 'opencdr-deploy>=0.6.0'
+python -m pip install --upgrade 'opencdr-deploy>=0.7.0'
 opencdr-deploy --help
 opencdr-deploy --version
 ```
 
-Python 3.11 or newer is required. Deploying Core also requires the tools used by
+Python 3.11 or newer is required. The [prebuilt release workflow](docs/prebuilt-releases.md)
+uses Python and AWS credentials for Core and Fleet installation. Source builds require the tools used by
 that Core release: AWS CLI, Node/npm, Serverless Framework, Docker, `jq`, and
 Python 3.12. `opencdr-deploy doctor` checks the selected installation.
 In each new terminal, run `. "$HOME/.opencdr-tools/bin/activate"` to use the
@@ -32,11 +33,18 @@ installed tool. These shell commands apply to macOS/Linux or Windows WSL.
 
 ## Deploy and operate Fleet Manager
 
-Fleet commands require OpenCDR Deploy 0.6.0 or later. The managed source defaults
-to Fleet Manager **v0.1.1**, which supports small-account Lambda quotas. Fleet
+Scoped IAM management and prebuilt releases require OpenCDR Deploy 0.7.0 or later.
+The managed source defaults
+to Fleet Manager **v0.2.0**, which supports small-account Lambda quotas. Fleet
 Manager runs in the security account; it polls registered Core agents and forwards
 explicit API operations. It does not deploy Core stacks or replace Core as the
 authority for detections, configuration and response execution.
+
+Health/configuration cadence is configurable with `--poll-interval-minutes`
+(1–60, default 1) and `--full-refresh-minutes` (at least the poll interval, at most
+1440, default 60). Source packaging and compatible prebuilt `release plan`
+support these options. The local P1 implementation adds separate durable detection
+collection options described below; publication and live acceptance remain pending.
 
 You can run these commands from any directory. **No fleet-manager clone is
 required.** Git, Node/npm, Python 3.12+ and an authenticated AWS profile are needed
@@ -95,7 +103,7 @@ opencdr-deploy fleet connect security-prod \
   --url https://FLEET_API_ID.execute-api.us-east-1.amazonaws.com/prod \
   --profile security-admin \
   --security-account-id 222222222222 \
-  --region us-east-1 --stage prod
+  --region us-east-1 --stage prod --access administrator
 opencdr-deploy fleet list
 opencdr-deploy fleet status --fleet security-prod
 ```
@@ -119,19 +127,24 @@ The reviewed file contains no credentials.
 
 ```bash
 aws sso login --profile member-admin
-opencdr-deploy fleet agents register --fleet security-prod \
+opencdr-deploy fleet agents bootstrap --fleet security-prod \
   --file agent.json --core-profile member-admin
+# Apply the emitted exact role ARNs to the Core trust policy first.
+opencdr-deploy fleet agents register --fleet security-prod --file agent.json
 opencdr-deploy fleet agents list --fleet security-prod
 opencdr-deploy fleet agents show member-prod --fleet security-prod
 ```
 
-Providing `--core-profile` explicitly prepares scoped read/operator API keys in the
-member account and copies them directly to the security account's SSM namespace.
-Both account identities are checked. The keys are never printed or written to the
-registration file. Without `--core-profile`, registration makes no AWS key changes
-and assumes SSM credentials were prepared separately. `fleet agents bootstrap`
-performs only that credential setup. Review Core's management API monthly quota
-before enabling one-minute polling; the legacy 10,000-request quota is insufficient.
+New registrations default to `auth_mode: iam`. `bootstrap` verifies both AWS
+accounts and emits the Fleet role ARNs that Core must trust. Apply those principals
+through the reviewed Core deployment, then register without `--core-profile`.
+IAM uses temporary credentials; no Core keys are created or copied. Select
+`write_access: operator`, `responder` or `administrator` explicitly and start with
+`allow_writes: false`. See [IAM and rollouts](https://github.com/dbnz-io/opencdr-fleet-manager/blob/main/docs/iam-and-rollouts.md).
+
+For an explicit `auth_mode: legacy-api-key` migration registration, bootstrap still
+prepares scoped keys in security-account SSM. Its monthly quota must cover polling;
+10,000 requests cannot support one request per minute.
 
 To import or rotate an existing scoped key through hidden terminal input:
 
@@ -147,12 +160,12 @@ opencdr-deploy fleet agents configuration member-prod --kind list --fleet securi
 opencdr-deploy fleet agents request member-prod GET '/rules?rule_kind=signal' --fleet security-prod
 opencdr-deploy fleet agents request member-prod PUT /rules/example \
   --file rule-update.json --fleet security-prod
-opencdr-deploy fleet agents request member-prod DELETE '/rules/example?rule_kind=signal' \
+opencdr-deploy fleet agents request member-prod DELETE '/rules/example?rule_kind=signal&expected_rev=3' \
   --fleet security-prod
 ```
 
 Forwarded paths and JSON bodies use the Core API contract, including each target's
-`expected_rev`. Writes need both operator SSM credentials and `allow_writes: true`
+`expected_rev`. Writes need the selected IAM management authority (or legacy write credentials) and `allow_writes: true`
 on the agent registration. Update registration with a full reviewed file:
 
 ```bash
@@ -194,22 +207,29 @@ workloads consume the account's shared pool. Hardened enables extra table recove
 controls; a downgrade requires `--allow-protection-downgrade` explicitly.
 
 If an initial deployment fails, the stack can disappear while retained DynamoDB
-tables remain. The CLI detects this before attempting another deploy. Import those
-tables into a minimal stack, then let Serverless finish deployment:
+tables remain. The CLI detects this before attempting another deploy. Compatible
+source builds reattach those tables and their original detection evidence bucket
+through a saved import-only plan:
 
 ```bash
 opencdr-deploy fleet recover security-prod \
-  --profile security-admin --security-account-id 222222222222 --region us-east-1 --stage prod
-# Review the printed import-only plan, then explicitly apply it:
+  --profile security-admin --security-account-id 222222222222 --region us-east-1 --stage prod \
+  --out fleet-recovery.json
+# Review the saved plan and copy its digest before execution:
 opencdr-deploy fleet recover security-prod \
-  --profile security-admin --security-account-id 222222222222 --region us-east-1 --stage prod --execute
-opencdr-deploy fleet deploy security-prod
+  --profile security-admin --security-account-id 222222222222 --region us-east-1 --stage prod \
+  --execute --plan fleet-recovery.json --expected-plan-digest REVIEWED_64_CHARACTER_SHA256
 ```
 
-Recovery preserves the existing table names, data, TTL and PITR settings. It does
-not delete the retained tables or reset their contents. It refuses a change set
-containing any action other than `Import`. Fleet Manager IAM permission guidance
-and service limits are in its [repository](https://github.com/dbnz-io/opencdr-fleet-manager).
+Recovery binds table UUIDs, original stack lineage and bucket identity; it
+preserves supported storage configuration and refuses non-import actions. Retry
+unknown outcomes with the same saved plan and digest. Both schedules stay paused
+for the first runtime update. Use the [complete recovery procedure](docs/fleet-storage-recovery.md)
+for compatible packaging, first-update checks and acceptance measurements.
+Reattaching storage does not repair a replaced worker principal or prove complete
+history. Use `fleet worker-identity NAME` and the separate
+[principal handoff procedure](../opencdr-internal/docs/detection-handoffs.md) in the
+workspace for that review. These implementations still need live acceptance.
 
 ## Install the optional MCP client
 
@@ -230,8 +250,9 @@ is injected into the deployment manager's isolated environment, and the
 `opencdr-mcp` executable is placed beside `opencdr-deploy`. Use `--dry-run` to
 show the exact pip command without changing the environment.
 
-The MCP package can manage any OpenCDR deployment, but it still needs that
-deployment's API URL and a suitably scoped API key. Installation does not read
+MCP 0.3.0 supports IAM-capable Core releases with an API URL, expected deployment
+identity and scoped AWS profile. Legacy API-key connections remain available for
+migration. Installation does not read
 credentials from the deployment registry or silently configure an MCP client.
 See the [opencdr-mcp documentation](https://github.com/dbnz-io/opencdr-mcp) for
 profiles and client registration.
@@ -449,13 +470,17 @@ it will be removed only in a separately announced major Core release.
 
 ## Manage the complete REST API
 
-API-only operators do not need AWS credentials or a Core checkout. Create an
-owner-readable JSON connection file, for example `customer-dev.json`:
+API operators do not need a Core checkout. Use an IAM profile authorized for the
+selected management path and an owner-readable connection file, for example
+`customer-dev.json`:
 
 ```json
 {
+  "mode": "core",
+  "auth_mode": "iam",
   "url": "https://example.execute-api.us-east-1.amazonaws.com/dev",
-  "key": "REPLACE_WITH_A_SCOPED_CORE_API_KEY",
+  "aws_profile": "customer-operator",
+  "access": "operator",
   "deployment": {
     "account_id": "111111111111",
     "home_region": "us-east-1",
@@ -472,22 +497,36 @@ opencdr-deploy api request POST /rules/validate \
 opencdr-deploy api request GET /rules/runtime-status --connection customer-dev.json
 ```
 
-The file must use HTTPS and contain `url` and `key`. The optional `deployment`
-fields are checked against Core's `/status` before an operation; a mismatch stops
-the request. Use one file per agent to select another account, region or stage.
-Explicit connections never use environment or SSM credentials and cannot be
-combined with `--deployment`. API requests refuse redirects to protect the key.
-Keep these files out of Git. The URL/key fields also work in opencdr-mcp's config
-file; its current server does not enforce the optional deployment identity fields.
+The file must use the regional AWS HTTPS endpoint. IAM requires all three
+`deployment` identity fields and verifies them against `/status` before an
+operation. CLI and MCP 0.3.0 accept this same file and enforce its identity checks.
+The `access` selector does not grant IAM permissions. Use one file per agent;
+`--connection` cannot be combined with `--deployment`. Requests refuse redirects.
+
+The local consumer-receipt implementation adds `access: delivery` for a dedicated
+Core connection. It can register/inspect `/detections/consumers/{id}`, POST
+`/read` with `expected_rev`, and POST `/ack` with `expected_rev` and `receipt_id`.
+Use the same `api request ... --connection ... --file ...` commands. Persist a
+page durably before acknowledging it; after an uncertain result inspect consumer
+status. This role cannot configure Core or run responses. It is a source feature
+pending release/live acceptance, not an additional installer or an AWS grant
+created merely by changing the connection JSON.
+
+For explicit legacy migration, a file containing `url`, `key` and optional
+`deployment` identity fields uses that key without AWS credentials or SSM lookup.
+Keep files containing keys out of Git. New deployments disable legacy access.
 
 For registered AWS installations, the existing commands below retrieve the
-selected installation's endpoint/key through its AWS profile. Infrastructure
-operations still use that AWS path. Platform-owned cases, assignments, triage and
-approvals are outside the Core API and are not part of CLI parity.
+selected installation's endpoint through its AWS profile. Infrastructure
+operations still use that AWS path. The local P2/P3 candidate adds engine-owned
+cases, detection handling and the content library through the same API command.
+Existing SaaS records remain separate until migration. Approval policy and
+durable job authorization remain pending.
 
-The manager retrieves the selected installation's API URL and full-scope key
-from `/opencdr-<stage>/api-url` and `/opencdr-<stage>/api-key` in SSM at request
-time. It never copies them into the registry.
+The manager retrieves the API URL from `/opencdr-<stage>/api-url` in SSM.
+IAM installations sign requests with their AWS credentials. Only legacy
+installations retrieve `/opencdr-<stage>/api-key`; keys are never copied into
+the registry.
 
 ```bash
 # Discover routes supported by the deployed Core version.
@@ -503,7 +542,8 @@ time. It never copies them into the registry.
 "${DEPLOY[@]}" api request POST /rules/validate --file candidate.json
 "${DEPLOY[@]}" api request POST /rules/evaluate --file evaluation.json
 "${DEPLOY[@]}" api request POST /rule-releases/plan --file release.json
-"${DEPLOY[@]}" api request POST /rule-releases/apply --file release.json
+# After review, add the returned digest as expected_plan_digest in this manifest.
+"${DEPLOY[@]}" api request POST /rule-releases/apply --file reviewed-release.json
 
 # Any other current or future JSON route.
 "${DEPLOY[@]}" api request GET /ir-roles
@@ -562,3 +602,76 @@ should be configured before announcing the first release.
 ## License
 
 Mozilla Public License 2.0. See [LICENSE](LICENSE).
+
+### Independent detection collection options (local P1 implementation)
+
+Compatible Fleet builds accept `--detection-poll-interval-minutes` (1–60),
+`--detection-retention-days` (7–365), `--detection-poll-concurrency` (2–1000),
+and `--enable-detection-polling` / `--pause-detection-polling` on `fleet package`,
+`fleet deploy` and portable `release plan`. These are separate from health and
+configuration polling. Omitted values preserve existing configuration.
+IAM bootstrap includes the detection worker's exact observer role; apply its
+reviewed Core trust update before expecting collection to succeed.
+
+`fleet agents show AGENT` includes collection status. The specific route is
+`fleet request GET /v1/agents/AGENT/detections/status`. Indexed central queries and
+explicit retained-source backfill/reconciliation are implemented locally; backfill
+is never automatic. `fleet recover` now reattaches the paired retained detection
+table and evidence bucket using a reviewed plan, with polling paused. See the
+[recovery guide](docs/fleet-storage-recovery.md) for supported configurations and
+remaining consumer-identity/restore gates. Current changes are not yet published.
+
+
+Reviewed [feed storage and consumer recovery](../opencdr-internal/docs/detection-feed-recovery.md)
+is implemented locally through Deploy API commands: inspect physical binding,
+review/apply generation rotation, complete retained-source backfill, then queue
+Fleet replay with polling paused. This does not initiate AWS PITR or claim live
+recovery acceptance.
+
+Detection handling and triage access: see [operator notes](docs/detection-handling.md).
+
+## Operational cases (P2 candidate)
+
+The local candidate adds shared operational cases: Core owns standalone cases,
+Fleet owns multi-account cases. Read `capabilities.operational_cases == "1.0.0"`
+before using `/cases` (Core) or `/v1/cases` (Fleet). Create, edit, notes, verified
+attachments, retained evidence, close/reopen and immutable history use IAM,
+revision checks and stable request IDs. Cases track SIEM work; they do not run
+investigations or change detection handling. Fleet requires explicit principal
+account grants, even for administrators, and never fans out case reads to Core.
+
+Use the [owner deployment/test and KPI guide](../opencdr-internal/docs/operational-cases.md) for grants, Deploy commands,
+limits, failure scenarios and remaining live/retention/migration gates. This
+candidate is locally tested; it has not been deployed or publicly promoted.
+
+### Dedicated connector connections (P2 candidate)
+
+Core IAM connection JSON and saved Fleet connections now accept
+`access: integration`. This signs only the dedicated entry-point URL; the actual
+AWS caller policy must restrict the connector role to that entry point. The
+backend permits status discovery and scoped case external-status reports only.
+Use an administrator connection to manage `/case-integrations/{id}` trust
+bindings. In Fleet mode prefix the path with `/v1` and operate on Fleet's cases.
+
+`api request` / `fleet request` also support active-case lookup and selected Core
+response-outcome reads without another deployment tool. Use `--file` for report
+JSON, retain exact request IDs/bodies for retry, and keep vendor credentials out
+of requests and connection files. This does not install a native SIEM adapter.
+The coordinated Core manual `docs/case-connectors-and-outcomes.md` contains the
+role/account/origin binding, upgrade constraints and manual acceptance sequence.
+
+## Content library (P3 local candidate)
+
+Deploy's existing signed API commands are sufficient for the new library; no
+additional operator tool is needed. Use `api request` with `/library/*` against
+standalone Core, or `fleet request` with `/v1/library/*` against the customer Fleet.
+Check `content_library` and `library_release_snapshots` capabilities first.
+Operator access creates/edits drafts and freezes snapshots; observer/triage read.
+Stable request IDs and current head revisions are required for safe retries.
+Saving/freezing never activates, validates or approves runtime content.
+
+See the coordinated [library deployment/test manual and KPIs](../opencdr-internal/docs/content-library.md)
+for payloads, retained-storage limitations and manual acceptance. These changes
+are local source, pending packaging/live acceptance and public release.
+
+See [owner automation and subscription initialization](docs/owner-automation.md) for portable runners, exact-receipt retry and reviewed new-consumer cutover.
