@@ -117,6 +117,18 @@ class FleetAPI:
     def __init__(self, config: dict[str, Any], session=None):
         self.config = config
         self.url = endpoint(config["api_url"], config["region"], config["stage"])
+        access = config.get("access")
+        if access:
+            if access not in {
+                "observer",
+                "triage",
+                "operator",
+                "responder",
+                "administrator",
+                "integration",
+            }:
+                raise FleetManagerError("Invalid Fleet management access")
+            self.url += "/management/" + access
         self.session = session or aws_session(config)
 
     def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
@@ -125,6 +137,23 @@ class FleetAPI:
             raise FleetManagerError("Supported methods: GET, POST, PUT, DELETE")
         if method == "GET" and body is not None:
             raise FleetManagerError("GET requests cannot contain a body")
+        from .delegation import delegated_request
+
+        try:
+            method, path, body = delegated_request(
+                method,
+                path,
+                body,
+                self.config.get("identity"),
+                {
+                    "account_id": self.config["security_account_id"],
+                    "home_region": self.config["region"],
+                    "stage": self.config["stage"],
+                },
+                prefix="/v1",
+            )
+        except ValueError as error:
+            raise FleetManagerError(str(error)) from error
         raw = json.dumps(body, separators=(",", ":")).encode() if body is not None else None
         if raw is not None and len(raw) > 2_000_000:
             raise FleetManagerError("Fleet API request body exceeds 2 MB")
@@ -153,13 +182,13 @@ class FleetAPI:
             raise FleetManagerError(message) from error
         with response:
             try:
-                payload = response.read(2_000_001)
+                payload = response.read(4_000_001)
             except (OSError, TimeoutError) as error:
                 raise FleetManagerError(
                     "Fleet response was interrupted; inspect agent state before retrying a write"
                 ) from error
-            if len(payload) > 2_000_000:
-                raise FleetManagerError("Fleet response exceeds 2 MB; use narrower pagination")
+            if len(payload) > 4_000_000:
+                raise FleetManagerError("Fleet response exceeds 4 MB; use narrower pagination")
             try:
                 value = json.loads(payload) if payload else None
             except (ValueError, UnicodeError) as error:

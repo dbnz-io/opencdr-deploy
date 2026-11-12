@@ -1,0 +1,103 @@
+name: Build deployment candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        type: choice
+        options: [opencdr, opencdr-fleet-manager]
+        required: true
+      source_tag:
+        description: Reviewed immutable service release tag
+        required: true
+      security_profile:
+        type: choice
+        options: [standard, hardened]
+        default: standard
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: release-build
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PRODUCT: ${{ inputs.product }}
+      SOURCE_TAG: ${{ inputs.source_tag }}
+      SECURITY_PROFILE: ${{ inputs.security_profile }}
+      SERVERLESS_LICENSE_KEY: ${{ secrets.SERVERLESS_LICENSE_KEY }}
+    steps:
+      - name: Validate immutable input
+        run: |
+          [[ "$SOURCE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {path: installer, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: dbnz-io/${{ inputs.product }}
+          ref: ${{ inputs.source_tag }}
+          path: service
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with: {python-version: '3.12'}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22'}
+      - name: Use dedicated release build role
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.OPENCDR_RELEASE_BUILD_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Install locked build dependencies
+        working-directory: service
+        run: |
+          npm ci --ignore-scripts
+          if [[ "$PRODUCT" == opencdr ]]; then
+            python -m pip install --require-hashes -r requirements-dev.txt
+          else
+            python -m pip install --require-hashes -r requirements.lock
+            python -m pip install -e '.[dev]'
+          fi
+          python -m pip install ../installer 'cfn-lint==1.60.0'
+      - name: Test and build runtime
+        working-directory: service
+        run: |
+          python -m pytest -q
+          if [[ "$PRODUCT" == opencdr-fleet-manager ]]; then
+            python scripts/verify_package.py
+          fi
+          npx serverless package --stage releasebuild --package .serverless \
+            --param="securityProfile=$SECURITY_PROFILE"
+          if [[ "$PRODUCT" == opencdr ]]; then
+            python scripts/verify_package.py .serverless
+          fi
+      - name: Export and validate portable candidate
+        run: |
+          build_account=$(aws sts get-caller-identity --query Account --output text)
+          runtime=service/.serverless/opencdr.zip
+          if [[ "$PRODUCT" == opencdr-fleet-manager ]]; then
+            runtime=service/build/fleet-manager.zip
+          fi
+          opencdr-deploy release export service/.serverless/cloudformation-template-update-stack.json \
+            "$runtime" release --product "$PRODUCT" --version "${SOURCE_TAG#v}" \
+            --account-id "$build_account" --region us-east-1 --stage releasebuild > candidate.json
+          cfn-lint --ignore-checks W -t release/template.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path('candidate.json').read_text())
+          Path('release/MANIFEST.sha256').write_text(result['sha256'] + '  release.json\n')
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ inputs.product }}-${{ inputs.source_tag }}-${{ inputs.security_profile }}-candidate
+          path: release/
+          if-no-files-found: error
+
+# Candidates are not published automatically. Clean installation, retained-stack
+# upgrade and live IAM contract checks are release gates documented in
+# docs/prebuilt-releases.md. No customer AWS resources are deployed by this job.
