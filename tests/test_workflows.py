@@ -53,7 +53,7 @@ def test_guided_execution_uses_verified_owner_once(tmp_path, monkeypatch, capsys
 def test_invalid_command_stops_before_transport(tmp_path, monkeypatch, change):
     construct = MagicMock()
     monkeypatch.setattr(workflows, "CoreAPI", construct)
-    with pytest.raises(Exception):
+    with pytest.raises(workflows.FleetManagerError):
         workflows.run(args(tmp_path, body=command(**change), id="b" * 32))
     construct.assert_not_called()
 
@@ -141,11 +141,21 @@ def test_grant_subject_cannot_escape_owner_route(tmp_path, monkeypatch):
 def test_extension_write_requires_exact_case_receipt(tmp_path, monkeypatch):
     client = MagicMock()
     client.verify.return_value = {"deployment": OWNER}
-    client.request.return_value = (200, {"deployment": OWNER, "case": {"case_id": "b" * 32, "rev": 3}})
+    client.request.return_value = (
+        200,
+        {"deployment": OWNER, "case": {"case_id": "b" * 32, "rev": 3}},
+    )
     monkeypatch.setattr(workflows, "CoreAPI", lambda _: client)
-    body = command(indicator={"type": "domain", "value": "example.com"}, relationship="unconfirmed", note="Fixture", source={"kind": "analyst"})
+    body = command(
+        indicator={"type": "domain", "value": "example.com"},
+        relationship="unconfirmed",
+        note="Fixture",
+        source={"kind": "analyst"},
+    )
     command_args = args(tmp_path, action="curate-indicator", id="b" * 32, body=body)
     assert workflows.run(command_args) == 0
-    client.request.assert_called_once_with("POST", "/cases/" + "b" * 32 + "/extensions/indicators", body)
+    client.request.assert_called_once_with(
+        "POST", "/cases/" + "b" * 32 + "/extensions/indicators", body
+    )
     with pytest.raises(workflows.FleetManagerError, match="receipt mismatch"):
         workflows.validate_result(command_args, body, {"case": {"case_id": "c" * 32, "rev": 3}})
