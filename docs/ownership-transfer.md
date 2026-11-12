@@ -1,7 +1,7 @@
 # Native engine ownership transfer
 
 Native Core/Fleet transfer and reverse recovery passed the isolated P7 engine
-rehearsal on 2026-11-11. See [the acceptance record](../../opencdr-internal/docs/roadmaps/p7-engine-acceptance-2026-11-11.md). Public release acceptance remains P8.
+rehearsal on 2026-11-11. The dated acceptance record is retained in the operator evidence bundle. Public release acceptance remains P8.
 Use only the reviewed installed Deploy candidate and exact Core/Fleet releases
 containing its ownership contract. Application/SaaS migration and hosted consumers
 remain P10.

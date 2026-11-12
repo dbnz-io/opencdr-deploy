@@ -165,7 +165,7 @@ verify each delivery subscription/generation and then prepare one reviewed Fleet
 plan with `--enable-detection-polling`. Preserve existing consumers and pending receipts.
 Inspect `/v1/agents/AGENT/detections/status` until its checkpoint catches up; record the
 actual observation time, generation and lag. Do not treat a manual queue wake-up as a
-normal-schedule performance result. See [Fleet acceptance](../../opencdr-fleet-manager/docs/acceptance.md).
+normal-schedule performance result. See [Fleet acceptance](https://github.com/dbnz-io/opencdr-fleet-manager/blob/main/docs/acceptance.md).
 
 ## Cases, Library, reviewed changes and automation
 

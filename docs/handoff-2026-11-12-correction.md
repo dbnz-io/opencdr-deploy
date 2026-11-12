@@ -16,8 +16,8 @@ catalog also validates (30 rules, no reusable lists); schema acceptance does not
 prove native evaluator results or response behavior. No catalog was loaded, no
 response was armed and no cloud write was performed for this correction.
 
-The archived catalog is retained in
-`.implementation/opencdr-p89-live-20261112-131823/detection-rules-f65fc69a437b9de00f0a7528a5a9c05492e9b922.tar`;
+The operator evidence retains the archived catalog
+`detection-rules-f65fc69a437b9de00f0a7528a5a9c05492e9b922.tar`;
 SHA256 `7373c7feb85775c7896fa68ee47d5526aa65357af92ede02b4f845651e58b502`.
 `rules-provenance.json` alongside it records the parent commit, both catalog file
 inventories and the exact validation runtime hash. Derive future release pins from

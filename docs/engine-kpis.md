@@ -2,7 +2,7 @@
 
 Use UTC half-open windows `[start,end)` and retain the query, dimensions, timestamped
 samples, release hashes and fixture manifest. The threshold source is
-`opencdr-internal/docs/roadmaps/p0-p1-performance-budgets.json`; never change a threshold
+[versioned acceptance budgets](https://github.com/dbnz-io/opencdr/blob/main/docs/acceptance-budgets.json); never change a threshold
 because a measurement failed. The owner explicitly deferred PERF-04 (100000
 records/10readers plus concurrent distribution) on2026-11-11. Its thresholds and
 failed result are retained; it is excluded from tomorrow's sequential candidate

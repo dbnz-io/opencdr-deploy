@@ -228,7 +228,7 @@ for the first runtime update. Use the [complete recovery procedure](docs/fleet-s
 for compatible packaging, first-update checks and acceptance measurements.
 Reattaching storage does not repair a replaced worker principal or prove complete
 history. Use `fleet worker-identity NAME` and the separate
-[principal handoff procedure](../opencdr-internal/docs/detection-handoffs.md) in the
+[principal handoff procedure](https://github.com/dbnz-io/opencdr/blob/main/docs/detection-handoffs.md) in the
 workspace for that review. These implementations still need live acceptance.
 
 ## Install the optional MCP client
@@ -622,7 +622,7 @@ table and evidence bucket using a reviewed plan, with polling paused. See the
 remaining consumer-identity/restore gates. Current changes are not yet published.
 
 
-Reviewed [feed storage and consumer recovery](../opencdr-internal/docs/detection-feed-recovery.md)
+Reviewed [feed storage and consumer recovery](https://github.com/dbnz-io/opencdr/blob/main/docs/detection-feed-recovery.md)
 is implemented locally through Deploy API commands: inspect physical binding,
 review/apply generation rotation, complete retained-source backfill, then queue
 Fleet replay with polling paused. This does not initiate AWS PITR or claim live
@@ -640,7 +640,7 @@ revision checks and stable request IDs. Cases track SIEM work; they do not run
 investigations or change detection handling. Fleet requires explicit principal
 account grants, even for administrators, and never fans out case reads to Core.
 
-Use the [owner deployment/test and KPI guide](../opencdr-internal/docs/operational-cases.md) for grants, Deploy commands,
+Use the [owner deployment/test and KPI guide](https://github.com/dbnz-io/opencdr/blob/main/docs/operational-cases.md) for grants, Deploy commands,
 limits, failure scenarios and remaining live/retention/migration gates. This
 candidate is locally tested; it has not been deployed or publicly promoted.
 
@@ -670,7 +670,7 @@ Operator access creates/edits drafts and freezes snapshots; observer/triage read
 Stable request IDs and current head revisions are required for safe retries.
 Saving/freezing never activates, validates or approves runtime content.
 
-See the coordinated [library deployment/test manual and KPIs](../opencdr-internal/docs/content-library.md)
+See the coordinated [library deployment/test manual and KPIs](https://github.com/dbnz-io/opencdr/blob/main/docs/content-library.md)
 for payloads, retained-storage limitations and manual acceptance. These changes
 are local source, pending packaging/live acceptance and public release.
 

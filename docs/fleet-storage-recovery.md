@@ -148,7 +148,7 @@ Do not enable detection polling solely because the import completed. A deleted
 and recreated worker role has a different IAM principal ID, even if its ARN is
 the same. Existing Core consumers remain owned by the old principal. This flow
 does not transfer ownership, reconcile a new feed incarnation or reset a cursor.
-Use the separate [reviewed principal handoff](../../opencdr-internal/docs/detection-handoffs.md)
+Use the separate [reviewed principal handoff](https://github.com/dbnz-io/opencdr/blob/main/docs/detection-handoffs.md)
 for a known old/new owner in the same feed incarnation. Deploy's read-only
 `fleet worker-identity NAME` resolves the replacement worker's immutable identity.
 Feed replacement, unknown historical owner discovery and live role-replacement
@@ -176,7 +176,7 @@ replace storage or enable polling. Live CloudFormation import/drift, IAM identit
 100-account catch-up and measured AWS costs are still required for P8 acceptance.
 
 
-After resources are available, [reviewed feed recovery](../../opencdr-internal/docs/detection-feed-recovery.md)
+After resources are available, [reviewed feed recovery](https://github.com/dbnz-io/opencdr/blob/main/docs/detection-feed-recovery.md)
 can reconnect a restored Fleet checkpoint through a fresh consumer, including
 when Core's feed or the worker identity changed. Existing Fleet evidence and
 metadata remain intact. This complements retained-resource reattachment; neither
